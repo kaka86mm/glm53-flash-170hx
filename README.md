@@ -1,147 +1,218 @@
-# GLM-5.3-Flash on 4x CMP 170HX — EXL3 / PP4 / Marlin sidecar / DFlash2
+# GLM-5.3-Flash Serving on 4× CMP 170HX
 
-在 4 张 NVIDIA CMP 170HX（SM80 矿卡，PCIe Gen2 x4，无 P2P/NVLink）上以生产质量服务
-GLM-5.3-Flash（320B MoE，18B 激活，原生多模态）：流水线并行 4、EXL3 4bpw 权重 +
-Marlin INT4 decode sidecar、DFlash2 k=7 投机解码、**512K 上下文 / 153 万 token KV 池**。
+Production deployment of GLM-5.3-Flash (320B-parameter MoE, 18B active, natively
+multimodal) on four NVIDIA CMP 170HX GPUs (SM80, PCIe Gen2 x4, no P2P/NVLink):
 
-本仓库 = 部署配方 + 关键补丁 + 基准与生产验收全记录，基于
-[hyd998877/vllm_170hx_glm53-flash-exl3-optimized](https://github.com/hyd998877/vllm_170hx_glm53-flash-exl3-optimized)
-（下称 upstream）改造。upstream 在本机四卡上无法直接部署（加载期必 OOM / DeepGEMM
-断言 / 内核路径错误），本仓库的六个补丁使其达到生产可用。
+- Pipeline parallelism 4 (PP4); TP is not viable on this interconnect
+- EXL3 4bpw weights with offline-generated Marlin INT4 decode sidecar
+- DFlash2 speculative decoding, k=7
+- 512K context window, 1.53M-token KV cache pool
+- Docker-based build and deployment
 
-## 性能（4×CMP 170HX 64GB，200W 功耗墙）
+This repository is a deployment overlay for
+[hyd998877/vllm_170hx_glm53-flash-exl3-optimized](https://github.com/hyd998877/vllm_170hx-glm53-flash-exl3-optimized)
+(referred to below as *upstream*). Upstream does not deploy correctly on this
+hardware as-is; the patches in `patches/` fix the failure modes encountered and
+are described in [Technical modifications](#technical-modifications). The
+`exllamav3` dependency is upgraded from 0.0.43 to 1.4.8, which improves prefill
+throughput by 5–8×.
 
-| 指标 | 数值 |
+## Results (4× CMP 170HX 64 GB, 200 W power cap)
+
+| Metric | Value |
 |---|---|
-| Prefill | 2.0k–3.9k tok/s（16k=2,040 / 64k=2,627 / 131k=3,926）|
-| 单流解码 | json 97.8 / code 73.9 / math 41–51 / prose 23.7 tok/s |
-| 并发聚合 | N1=54 / N4=153 / N8=185–213 / N16=188 tok/s |
-| 投机验收长度 | 最高 8.0/8（DFlash2 k=7；json/counting 饱和）|
-| 流式延迟 | TTFT 0.4s（短提示）；ITL mean 66ms / p95 70ms |
-| 长上下文 | needle 64k/128k/256k（95% 深度）全命中；256k 冷启 90s |
-| 最大输出 | 64K（24K 连续生成实测，31 tok/s 持速）|
-| KV 池 | 1,533,693 token（512K 满窗 ×2.93 路）|
-| 生产验收 | 质量 6/6 + 工具调用 + thinking 分离 + 视觉 + 8 路×6min 浸泡 0 错误 |
+| Prefill throughput | 2.0k–3.9k tok/s (16k ctx: 2,040; 64k: 2,627; 131k: 3,926) |
+| Single-stream decode | json 97.8 / code 73.9 / math 41–51 / prose 23.7 tok/s |
+| Aggregate decode | N1=54 / N4=153 / N8=185–213 / N16=188 tok/s |
+| Speculative acceptance length | up to 8.0/8 (DFlash2 k=7; saturated on json/counting) |
+| Streaming latency | TTFT 0.4 s (short prompt); ITL mean 66 ms, p95 70 ms |
+| Long context | needle retrieval at 64k/128k/256k (95% depth) all pass; 256k cold prefill 90 s |
+| Max output | 64K tokens (24K continuous generation verified at 31 tok/s) |
+| KV cache pool | 1,533,693 tokens (2.93 concurrent 512K requests) |
+| Production acceptance | quality 6/6, tool calling, reasoning separation, vision, 8-way 6-minute soak with 0 errors |
 
-对比参考：同为 4×170HX 的 NVFP4 栈（prefill 3.7k、单流 36–44、64K 窗口不稳）与
-AWQ 无投机栈（~40 tok/s），本栈在保持 prefill 同档的同时把解码/并发翻倍，且窗口达 512K。
+Reference points on identical hardware: an NVFP4 stack (prefill 3.7k tok/s,
+single-stream 36–44 tok/s, unstable beyond 64K context) and an AWQ stack without
+speculative decoding (~40 tok/s). This stack matches their prefill while
+doubling decode/concurrency throughput and extending the context window to 512K.
 
-## 硬件 / 软件要求
+## Requirements
 
-- 4× compute capability 8.0 GPU，每卡 ≥64GB（CMP 170HX 解锁 64GB；驱动 610.43.03 open + cmpunlocker）
-- PCIe Gen2 x4 即可（PP4 无逐层 allreduce；TP 在此拓扑上 prefill 仅 ~800 tok/s，不可用）
-- ≥229GB 系统内存（加载期 page cache 峰值）；磁盘 ~530GB：EXL3 权重 164G + Marlin sidecar 151G + DFlash2 草稿 2.3G + 镜像
-- upstream 源码 + 本仓库 patches（或直接用本仓库 Dockerfile）
+- 4× GPUs with compute capability 8.0, ≥64 GB each (CMP 170HX unlocked to
+  64 GB; driver 610.43.03 open + cmpunlocker)
+- PCIe Gen2 x4 links are sufficient: PP4 performs no per-layer all-reduce.
+  TP4 on this topology reaches only ~800 tok/s prefill and is not supported.
+- ≥229 GB system RAM (page-cache peak during loading)
+- ~530 GB disk: EXL3 checkpoint 164 GB + Marlin sidecar 151 GB + DFlash2 draft
+  2.3 GB + container image
+- Upstream source tree + the patches in this repository (or the Dockerfile
+  included here, which already contains the build fixes)
 
-## 快速开始
+## Repository layout
+
+```
+patches/    Three diffs against upstream HEAD (apply in numbered order)
+deploy/     build.sh (image build), launch_exl3.sh (serving),
+            lanes2.sh (sidecar generation across 4 GPUs)
+bench/      Spec-decode, concurrency, needle, prefill-ladder, and
+            production-acceptance test scripts
+docs/       results.md — full benchmark tables
+```
+
+## Quick start
 
 ```bash
-# 0) 取 upstream 源码并打补丁（或直接用含 patched Dockerfile 的本仓库树）
+# 1) Obtain upstream source and apply patches
 git clone https://github.com/hyd998877/vllm_170hx_glm53-flash-exl3-optimized.git
 cd vllm_170hx_glm53-flash-exl3-optimized
-git apply ../patches/*.patch          # 三个补丁按序
+git apply ../patches/001-*.patch ../patches/002-*.patch ../patches/003-*.patch
 
-# 1) 构建镜像（首次 ~5h；flashinfer wheel 建议先手工下载放进 fi/ 目录，
-#    Dockerfile 已改为 COPY 本地 wheel，规避构建期网络抖动）
+# 2) Build the image (first build ~5 h on 28 cores)
+#    The Dockerfile installs the flashinfer 0.6.17 wheel from a local copy
+#    (place it under fi/ beforehand; see 003 patch for rationale).
 bash ../deploy/build.sh
 
-# 2) 下载权重（国内走 ModelScope 更快）
-#    EXL3 主模型 164G:  Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw（= brandonmusic HF 版，config 逐字节一致）
-#    DFlash2 草稿 2.3G: incoai/GLM-5.3-Flash-DFlash2（CC BY-NC-ND，商用前自查许可）
+# 3) Download weights
+#    EXL3 checkpoint (164 GB): Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw on ModelScope
+#      (byte-identical config to brandonmusic/GLM-5.3-Flash-tr3-4bpw on Hugging Face)
+#    DFlash2 draft (2.3 GB): incoai/GLM-5.3-Flash-DFlash2
+#      (CC BY-NC-ND — review the license before commercial use)
 
-# 3) 生成 Marlin sidecar（42 层 ×3.6G，4 卡并行约 25 分钟）
+# 4) Generate the Marlin sidecar (42 layers × 3.6 GB, ~25 min on 4 GPUs)
 bash ../deploy/lanes2.sh
 
-# 4) 启动（512K 窗 / util 0.94 / DFlash2 k=7 / 200W 功耗墙）
+# 5) Launch (512K window, util 0.94, DFlash2 k=7, 200 W power cap)
 bash ../deploy/launch_exl3.sh
 ```
 
-## 相对 upstream 的六个关键补丁
+## Technical modifications
 
-1. **EXL3 张量硬释放（加载期必 OOM 的根因）**
-   upstream 在 sidecar 加载后用空 Parameter 替换旧 EXL3 张量，但引用未即时释放，
-   净增 3.6GB/层，第 8 个 MoE 层必 OOM。补丁：替换后 `gc.collect + synchronize +
-   empty_cache` 强制归还，加载内存曲线平稳在 ~41–44GB/卡。
-2. **`VLLM_PRETEND_NO_DEEP_GEMM=1`**
-   镜像把 DeepGEMM 编进了 SM80（arch list 含 8.0），其 attention API 运行期断言
-   SM90+。给 `has_deep_gemm()` 加 env 钩子模拟"未安装"，所有调用点走 Triton 回退
-   ——即 upstream 作者 venv 的真实环境（他没装 DeepGEMM）。
-3. **真实 `exllamav3.model.config` 加载 + sys.path 顺序**
-   upstream 的 `_exl3_module()` 往 sys.modules 塞假 config stub（只有 dummy
-   Config）。exllamav3 ≥1.4 的 `LinearEXL3` 惰性 import `NullConfig` → 假 stub 必炸；
-   而真 config.py 又会牵出 ext.py 的 JIT 重编（运行镜像无 nvcc）。补丁：sys.path
-   插入预编译 .so 目录 **提前** + importlib 从文件加载真 config.py，走 ext.py 的
-   precompiled 分支。
-4. **rank 错峰加载（`VLLM_EXL3_H2D_STAGGER_S=12`）**
-   Gen2 x4 上 4 rank 并发 sidecar H2D 突发触发链路重训 → 异步野写（Xid 31）。
-   每 rank 首次 H2D 前按 rank 序 sleep 错峰。
-5. **Dockerfile 构建修复**：flashinfer 钉版 rc10 缺 cubin wheel（404）→ 0.6.17
-   本地 wheel COPY；`max_jobs` 默认 2（28 核机器编译慢 10 倍）→ 20；
-   wheel 500MB 体积检查对私有镜像无意义 → RUN_WHEEL_CHECK=false；国内 dnf/PyPI 源。
-6. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`**（运行 env，作者原配方）。
+All modifications are diffs against upstream HEAD and are contained in
+`patches/`. Each one addresses a concrete, reproduced failure:
 
-### exllamav3 版本：0.0.43 → 1.4.8（prefill 5–8×）
+1. **EXL3 tensor release after sidecar swap (patch 001, `exl3.py`)**
+   Upstream replaces the per-layer EXL3 parameters with empty tensors after
+   the Marlin sidecar is live, but the original tensors are not released
+   promptly, adding a net ~3.6 GB per MoE layer. Loading fails with a
+   deterministic OOM at the 8th MoE layer (reproduced 3/3). The patch forces
+   `gc.collect()` + `cuda.synchronize()` + `empty_cache()` after the swap;
+   per-device memory then stays flat at ~41–44 GB through all 42 layers.
 
-upstream 钉的 0.0.43 是化石版。升到真上游 [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3)
-1.4.8 后 API 全兼容（`BC_BlockSparseMLP` 移到 libtorch/blocksparse_mlp_bc.h），
-**prefill 从 ~480 提升到 2.0k–3.9k tok/s，解码/并发零变化**——这是本栈最划算的单项升级。
+2. **`VLLM_PRETEND_NO_DEEP_GEMM=1` (patch 002, `import_utils.py`)**
+   The container image builds the vendored DeepGEMM with SM80 in its arch
+   list, making `has_deep_gemm()` return True; its attention APIs assert
+   SM90+ at runtime (observed as a startup abort in
+   `deepgemm-src/csrc/apis/attention.hpp:270`). The patch adds an
+   environment hook to `has_deep_gemm()` that reports the package as absent,
+   routing all call sites to their Triton fallbacks — the same configuration
+   as the upstream author's environment, where DeepGEMM is not installed.
 
-### 投机深度 k 的选择（DFlash2）
+3. **Real `exllamav3.model.config` loading and search-path ordering
+   (patch 001, `_exl3_module()`)**
+   Upstream installs namespace stubs into `sys.modules` to bypass the
+   `exllamav3` package initializer, including a synthetic
+   `exllamav3.model.config` that only defines a dummy `Config`. Under
+   exllamav3 ≥1.4, `LinearEXL3.__init__` lazily imports `NullConfig` from
+   that module, which fails against the stub. Additionally, importing the
+   real `config.py` pulls in `ext.py`, which invokes a JIT rebuild of the
+   extension unless the prebuilt `.so` directory is already on `sys.path`
+   (the runtime image has no nvcc, so a JIT build cannot succeed). The patch
+   (a) inserts the prebuilt-extension directory on `sys.path` *before* the
+   stub installation and (b) loads the real `config.py` from file via
+   importlib, activating `ext.py`'s precompiled-extension branch.
 
-实测 k=2→4→6→7：json 43→70→92→**98**，code 39→54→55→**74**，math 在 k=6 峰值
-（51），prose 恒 ~23（验收 1.6，无收益无损失）。**默认 k=7**；纯数学负载可退 k=6。
-k 越大 KV 池微缩（k4=137 万 / k7=125 万 @0.92；@0.94 为 153 万）。
+4. **Per-rank H2D staggering (`VLLM_EXL3_H2D_STAGGER_S=12`, patch 001)**
+   Concurrent sidecar host-to-device transfers across the 4 pipeline ranks
+   trigger PCIe link retrains on Gen2 x4 that surface as asynchronous
+   out-of-bounds writes (Xid 31, observed with each rank failing at a
+   different layer). The patch delays each rank's first sidecar transfer by
+   `rank × stagger` seconds. This is a mitigation specific to this
+   interconnect; on NVLink systems it is unnecessary but harmless.
 
-## 基准全表
+5. **Dockerfile build fixes (patch 003)**
+   - Upstream pins FlashInfer `v0.6.18rc10`, whose release lacks the cubin
+     wheel (HTTP 404 during build); pinned to 0.6.17 and installed from a
+     locally provided wheel to avoid transient network failures.
+   - `max_jobs` defaults to 2 in the upstream Dockerfile; raised to 20
+     (≈10× faster CUDA compilation on multi-core hosts).
+   - The 500 MB wheel-size check is disabled (`RUN_WHEEL_CHECK=false`),
+     relevant only for PyPI publication.
+   - AlmaLinux/PyPI mirrors are configured for builds in mainland China.
 
-见 [docs/results.md](docs/results.md)：prefill 曲线、k sweep、并发、needle、
-流式、64K 长输出、生产验收记分卡（含 litellm 全链路）。
+6. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** (runtime
+   environment, from the upstream author's recipe)
 
-## 已知问题与运维手册
+### exllamav3 0.0.43 → 1.4.8
 
-- **崩溃会楔卡**：Xid 31 之后该卡 `cudaErrorDevicesUnavailable`，`nvidia-smi -r`
-  不支持，唯一解 = 冷断电（rtcwake/手按）。概率约 1/10 boot；楔了就冷启重拉，10 分钟恢复。
-- **util 硬墙 0.94**：0.95+ 加载/长 prefill 期随机野写（Gen2 x4 显存余量物理边界）。
-- **内核升级陷阱**：unattended-upgrades 装的新内核没有 cmpunlocker 模块。已用
-  `GRUB_DEFAULT=saved` + `grub-set-default` 钉回有驱动的内核；再遇
-  driver-not-loaded 先 `uname -r`。
-- **原生 MTP 未竟**：GLM 自带 NextN 层（layer 45）在 EXL3 checkpoint 中完整，但
-  vLLM MTP 路径卡在 1.4.8 的 `BC_BlockSparseMLP` 构造器大改（~45→~55 参，新增
-  z/hyper-connection 束），需正式移植半天；且作者数据 DFlash2 线本就快于 MTP 线。
-- **小 max_tokens 陷阱**：模型总是先思考。`max_tokens<100` 时 content 可能为空、
-  答案落在 reasoning 里。客户端保持 ≥400 或由网关注入默认值。
-- **多模态**：颜色/OCR/计数/图表刻度估值全过（图表测试需坐标轴与柱高一致，否则
-  模型会"正确地"读出你画错的值——别问我怎么知道的）。
+Upstream pins exllamav3 0.0.43. Upgrading to
+[turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) 1.4.8
+requires modification 3 but is otherwise API-compatible
+(`BC_BlockSparseMLP` relocated to `libtorch/blocksparse_mlp_bc.h`). Measured
+effect: prefill 480 → 2,040–3,926 tok/s (5–8×) with no change in decode or
+concurrency throughput.
 
-## 生产接入
+### Speculative depth selection (DFlash2)
 
-后端暴露 OpenAI 兼容 API（:8093，model name `glm-flash`）。我们经 litellm 网关以
-既有模型名（`dsv4-vision`）对外，存量客户端零改动；工具调用 / thinking 分离
-（字段 `reasoning`，网关可归一为 `reasoning_content`）/ `chat_template_kwargs`
-（`enable_thinking`、`reasoning_effort`、`clear_thinking`）均经全链路验收。
+Measured across k = 2/4/6/7 (tok/s): json 43→70→92→98, code 39→54→55→74,
+math peaks at k=6 (51), prose is insensitive (~23, acceptance 1.6). Default
+k=7; k=6 is preferable for math-dominant workloads. The KV pool shrinks
+slightly with k (k4 = 1.37M / k7 = 1.25M tokens at util 0.92; 1.53M at
+util 0.94).
 
-## 致谢
+## Benchmarks
 
-- [hyd998877/vllm_170hx_glm53-flash-exl3-optimized](https://github.com/hyd998877/vllm_170hx_glm53-flash-exl3-optimized) — 本仓库的基座
-- [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) — EXL3 格式与内核（1.4.8 的 MGEMM 改进是 prefill 质变的来源）
-- [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) — sm80 backport 生态与 MTP 修复参考
-- [promisezackr/glm53-flash-170hx-pp8](https://github.com/promisezackr/glm53-flash-170hx-pp8) — 8 卡 NVFP4 路线的启发
-- dkpoulsen 的 170HX 实验记录（flock/加载串行/楔卡恢复经验）
+Full tables in [docs/results.md](docs/results.md): prefill curve, k sweep,
+concurrency, needle retrieval, streaming latency, 64K output, KV pool by
+configuration, and the production acceptance scorecard (measured through a
+litellm gateway on the serving path).
 
-## English summary
+## Known limitations and operations
 
-GLM-5.3-Flash (320B MoE, natively multimodal) served production-grade on 4× CMP 170HX
-mining cards (SM80, PCIe Gen2 x4, no P2P): PP4 + EXL3 4bpw + Marlin INT4 decode
-sidecar + DFlash2 k=7 speculative decoding, 512K context, 1.53M-token KV pool.
-This repo is a deployment overlay on hyd998877's fork with six essential patches
-(EXL3 tensor hard-release fixing a deterministic load-time OOM, DeepGEMM SM80
-assertion bypass, real-config loading for exllamav3≥1.4, per-rank H2D staggering
-for Gen2 link stability, Dockerfile build fixes) plus an exllamav3 0.0.43→1.4.8
-upgrade worth 5–8× prefill (480→3,926 tok/s @131k). Includes full benchmarks,
-k-sweep data, a production acceptance suite, and an ops runbook (wedge recovery,
-kernel pinning, util walls). Single-stream 23–98 tok/s by workload, 8-way
-aggregate 185–213 tok/s, TTFT 0.4s, ITL p95 70ms, zero errors in a 6-minute
-8-way soak.
+- **GPU wedge after a crash.** An Xid 31 fault leaves the affected GPU in a
+  state where `cudaSetDevice` fails (`cudaErrorDevicesUnavailable`) until
+  power is removed; `nvidia-smi -r` is not supported on this product.
+  Recovery is a cold power cycle (~10 min including engine restart).
+  Observed frequency ≈1/10 of engine starts.
+- **util 0.94 is the ceiling.** At 0.95+ the loading and long-prefill phases
+  fail with stochastic out-of-bounds writes (memory-headroom limit of the
+  Gen2 x4 topology on this board).
+- **Kernel upgrade hazard.** Unattended upgrades install kernels without the
+  cmpunlocker modules. `GRUB_DEFAULT=saved` plus `grub-set-default` pin the
+  boot to a driver-bearing kernel; on a `driver not loaded` symptom, check
+  `uname -r` first.
+- **Native MTP is not wired up.** The checkpoint ships a complete NextN
+  layer (layer 45, EXL3-quantized), but the vLLM MTP draft path requires
+  porting `_make_fused_bsz1` to the 1.4.8 `BC_BlockSparseMLP` constructor
+  (signature grew from ~45 to ~55 arguments, adding z/hyper-connection
+  bundles); estimated at half a day of work. Reference measurements also
+  show the DFlash2 draft outperforming MTP on this model family.
+- **Small `max_tokens` budgets.** The model always emits reasoning before
+  content; with `max_tokens < 100` the response may contain reasoning only.
+  Clients should request ≥400 tokens or rely on gateway-injected defaults.
+- **Vision.** Color identification, OCR, counting, and axis-calibrated chart
+  estimation all pass. Test fixtures must keep axis labels consistent with
+  drawn geometry — the model reads the chart as drawn, not as intended.
 
-License: Apache-2.0 (derivative of vLLM). Model weights under their own licenses
-(EXL3 pack: ShapleyMCG; DFlash2 draft: CC BY-NC-ND — check before commercial use).
+## Production integration
+
+The engine exposes an OpenAI-compatible API on port 8093 (served model name
+`glm-flash`). In the reference deployment it is fronted by a litellm gateway
+under a pre-existing model alias, requiring no client changes. Verified
+end-to-end through the gateway: tool calling, reasoning separated into a
+`reasoning` field (normalizable to `reasoning_content` at the gateway), and
+`chat_template_kwargs` (`enable_thinking`, `reasoning_effort`,
+`clear_thinking`).
+
+## Acknowledgments
+
+- [hyd998877/vllm_170hx_glm53-flash-exl3-optimized](https://github.com/hyd998877/vllm_170hx-glm53-flash-exl3-optimized) — base fork
+- [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) — EXL3 format and kernels; the 1.4.8 MGEMM scheduling work is the source of the prefill improvement
+- [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) — SM80 backport ecosystem and MTP fix references
+- [promisezackr/glm53-flash-170hx-pp8](https://github.com/promisezackr/glm53-flash-170hx-pp8) — the 8-way NVFP4 deployment that informed this work
+- dkpoulsen's 170HX lab notes — loading-serialization and crash-recovery practices
+
+## License
+
+Apache-2.0 (derivative of vLLM). Model weights are governed by their own
+licenses: the EXL3 pack under ShapleyMCG, the DFlash2 draft under
+CC BY-NC-ND — review both before commercial use.
