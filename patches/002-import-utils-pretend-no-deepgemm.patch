@@ -1,0 +1,17 @@
+diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
+index 03e3013..9abeef9 100644
+--- a/vllm/utils/import_utils.py
++++ b/vllm/utils/import_utils.py
+@@ -494,6 +494,12 @@ def has_deep_gemm() -> bool:
+     override with a newer version), then falls back to the vendored copy
+     bundled in the vLLM wheel.
+     """
++    import os as _os
++    if _os.environ.get("VLLM_PRETEND_NO_DEEP_GEMM") == "1":
++        # SM80: the vendored DeepGEMM asserts SM90+ in its attention APIs.
++        # Simulate "not installed" so all call sites take their Triton
++        # fallbacks (matches the reference 4x170HX deployment environment).
++        return False
+     return _has_module("deep_gemm") or _has_module("vllm.third_party.deep_gemm")
+ 
+ 

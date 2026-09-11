@@ -1,0 +1,353 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 0a1cab7..84a5711 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -126,6 +126,8 @@ ENV VIRTUAL_ENV="/opt/venv"
+ 
+ # Install system dependencies including build tools. The PyTorch manylinux
+ # image enables EPEL, which provides ccache.
++RUN sed -i -e "s|^mirrorlist=|#mirrorlist=|g" -e "s|^# baseurl=https://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|g" -e "s|^# baseurl=http://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|g" /etc/yum.repos.d/*.repo || true
++
+ RUN dnf install -y --setopt=install_weak_deps=False \
+         ccache \
+         git \
+@@ -208,8 +210,7 @@ COPY requirements/common.txt requirements/common.txt
+ COPY requirements/cuda.txt requirements/cuda.txt
+ COPY use_existing_torch.py use_existing_torch.py
+ COPY pyproject.toml pyproject.toml
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
++RUN     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && \
+         [ ! -f /tmp/vllm-requirements/rubin-prerelease.txt ]; then \
+         echo "INSTALL_RUBIN_PRERELEASE=true requires requirements/rubin-prerelease.txt" >&2; \
+@@ -278,8 +279,7 @@ RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+ # Track PyTorch lib versions used during build and match in downstream instances.
+ # We do this for both nightly and release so we can strip dependencies/*.txt as needed.
+ # Otherwise library dependencies can upgrade/downgrade torch incorrectly.
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    uv pip freeze | grep -i "^torch=\|^torchvision=\|^torchaudio=" > torch_lib_versions.txt \
++RUN     uv pip freeze | grep -i "^torch=\|^torchvision=\|^torchaudio=" > torch_lib_versions.txt \
+     && TORCH_LIB_VERSIONS=$(cat torch_lib_versions.txt | xargs) \
+     && echo "Installed torch libs: ${TORCH_LIB_VERSIONS}"
+ 
+@@ -310,8 +310,7 @@ RUN dnf install -y --setopt=install_weak_deps=False make perl-core \
+ WORKDIR /workspace
+ 
+ COPY requirements/build/rust.txt requirements/build/rust.txt
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    uv pip install --python /opt/venv/bin/python3 -r requirements/build/rust.txt
++RUN     uv pip install --python /opt/venv/bin/python3 -r requirements/build/rust.txt
+ 
+ # Copy only the Rust build inputs; build_rust.sh publishes artifacts needed
+ # by the wheel build stage.
+@@ -330,9 +329,7 @@ ENV SCCACHE_SERVER_PORT=4227
+ 
+ # Build with a stable version so this target snapshot is keyed only by Rust
+ # inputs. The child stage below relinks the crates that embed the exact version.
+-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+-    --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
++RUN         --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+     if [ "$USE_SCCACHE" = "1" ]; then \
+         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi; \
+         export RUSTC_WRAPPER=sccache; \
+@@ -346,9 +343,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+ # Relink with the exact Git-derived package version.
+ FROM rust-build-cache AS rust-build
+ 
+-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+-    --mount=type=bind,source=.git,target=.git \
++RUN         --mount=type=bind,source=.git,target=.git \
+     SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh
+ #################### RUST BUILD IMAGE ####################
+ 
+@@ -375,8 +370,7 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ # Use copy mode to avoid hardlink failures with Docker cache mounts
+ ENV UV_LINK_MODE=copy
+ 
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
++RUN     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+         echo "Installing build requirements with Rubin prerelease PyTorch..." \
+         && python3 use_existing_torch.py --prefix \
+         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt; \
+@@ -421,8 +415,7 @@ ARG VLLM_MAIN_CUDA_VERSION=""
+ ENV SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+csrc.build"
+ 
+ # Use existing torch for nightly and Rubin prerelease builds
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${PYTORCH_NIGHTLY}" = "1" ] || \
++RUN     if [ "${PYTORCH_NIGHTLY}" = "1" ] || \
+         [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+         python3 use_existing_torch.py --prefix; \
+     fi
+@@ -432,14 +425,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ # cmake/external_projects/deepgemm.cmake for the full picture.
+ COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+ ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
+-RUN --mount=type=cache,target=/root/.cache/uv \
+-    tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
++RUN     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
+ 
+ # Build the vLLM wheel
+ # if USE_SCCACHE is set, use sccache to speed up compilation
+ # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
++RUN     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+     if [ "$USE_SCCACHE" = "1" ]; then \
+         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi \
+         && export CMAKE_BUILD_TYPE=Release \
+@@ -456,9 +447,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ ARG vllm_target_device="cuda"
+ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
+ ENV CCACHE_DIR=/root/.cache/ccache
+-RUN --mount=type=cache,target=/root/.cache/ccache \
+-    --mount=type=cache,target=/opt/uv/cache \
+-    if [ "$USE_SCCACHE" != "1" ]; then \
++RUN         if [ "$USE_SCCACHE" != "1" ]; then \
+         # Clean any existing CMake artifacts
+         rm -rf .deps && \
+         mkdir -p .deps && \
+@@ -495,8 +484,7 @@ COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.
+ ARG DEEPEP_COMMIT_HASH=d4f41e4e93
+ ARG NVSHMEM_VER
+ ARG NCCL_VERSION
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    mkdir -p /tmp/ep_kernels_workspace/dist && \
++RUN     mkdir -p /tmp/ep_kernels_workspace/dist && \
+     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+         # The Rubin CUDA builder provides NCCL in its architecture-specific \
+         # toolkit directory rather than as a Python package. Give DeepEP a \
+@@ -530,10 +518,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ # builds use their SM107-capable system ptxas during the wheel build and at
+ # runtime.
+ COPY tools/build_triton_from_source.sh /tmp/build_triton_from_source.sh
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=cache,id=triton-source-${TARGETARCH},target=/root/.triton,sharing=locked \
+-    --mount=type=cache,id=triton-source-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked \
+-    set -eux; \
++RUN             set -eux; \
+     TRITON_WORKSPACE=/tmp/triton_from_source_workspace; \
+     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] \
+         && [ -z "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
+@@ -594,8 +579,7 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ # Use copy mode to avoid hardlink failures with Docker cache mounts
+ ENV UV_LINK_MODE=copy
+ 
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
++RUN     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+         echo "Installing build requirements with Rubin prerelease PyTorch..." \
+         && python3 use_existing_torch.py --prefix \
+         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt; \
+@@ -634,8 +618,7 @@ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
+ ENV VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1
+ 
+ # Use existing torch for nightly and Rubin prerelease builds
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${PYTORCH_NIGHTLY}" = "1" ] || \
++RUN     if [ "${PYTORCH_NIGHTLY}" = "1" ] || \
+         [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+         python3 use_existing_torch.py --prefix; \
+     fi \
+@@ -645,8 +628,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+     fi
+ 
+ # Build the vLLM wheel
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=bind,source=.git,target=.git \
++RUN     --mount=type=bind,source=.git,target=.git \
+     if [ "${vllm_target_device}" = "cuda" ]; then \
+         export VLLM_USE_PRECOMPILED=1; \
+         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \
+@@ -680,6 +662,14 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
+ #################### WHEEL BUILD IMAGE ####################
+ 
+ #################### DEV IMAGE ####################
++FROM csrc-build AS exl3-ext
++COPY scripts/build_exllamav3_ext.py /workspace/scripts/build_exllamav3_ext.py
++ARG PIP_INDEX_URL
++ENV TORCH_CUDA_ARCH_LIST=8.0
++RUN pip install --no-deps --target /opt/exl3_pkg exllamav3==1.4.8 \
++ && PYTHONPATH=/opt/exl3_pkg python3 scripts/build_exllamav3_ext.py --source stock --build-dir /tmp/exl3_ext \
++ && mkdir -p /opt/exl3 && cp /tmp/exl3_ext/exllamav3_ext.so /opt/exl3/
++
+ FROM base AS dev
+ 
+ ARG PIP_INDEX_URL UV_INDEX_URL
+@@ -710,8 +700,7 @@ COPY requirements/test/cuda.txt requirements/test/cuda.txt
+ COPY requirements/dev.txt requirements/dev.txt
+ COPY use_existing_torch.py use_existing_torch.py
+ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
++RUN     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+         echo "Installing dev requirements plus torch nightly..." \
+         && python3 use_existing_torch.py --prefix \
+         && cat torch_lib_versions.txt >> requirements/test/cuda.in \
+@@ -912,8 +901,7 @@ COPY requirements/common.txt /tmp/common.txt
+ COPY requirements/cuda.txt /tmp/requirements-cuda.txt
+ # FlashInfer is installed separately from release assets below for regular
+ # CUDA images. Rubin prerelease images retain their pinned requirements.
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
++RUN     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && \
+         [ ! -f /tmp/vllm-requirements/rubin-prerelease.txt ]; then \
+         echo "INSTALL_RUBIN_PRERELEASE=true requires requirements/rubin-prerelease.txt" >&2; \
+@@ -950,8 +938,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ ARG FLASHINFER_VERSION=0.6.18rc10
+ ARG FLASHINFER_RELEASE_TAG=v0.6.18rc10
+ ARG TARGETARCH
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
++RUN     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
+         set -eux; \
+         case "${TARGETARCH}" in \
+           amd64) FLASHINFER_WHEEL_ARCH="x86_64" ;; \
+@@ -997,8 +984,7 @@ RUN set -eux; \
+ # From versions.json: .openai_server_extras.timm, .openai_server_extras.runai_model_streamer
+ ARG TIMM_VERSION=">=1.0.17"
+ ARG RUNAI_MODEL_STREAMER_VERSION=">=0.15.7"
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    uv pip install --system accelerate 'modelscope<1.38' \
++RUN     uv pip install --system accelerate 'modelscope<1.38' \
+         "timm${TIMM_VERSION}" "runai-model-streamer[s3,gcs,azure]${RUNAI_MODEL_STREAMER_VERSION}"
+ 
+ # ============================================================
+@@ -1006,6 +992,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ # ============================================================
+ 
+ FROM vllm-runtime-base AS vllm-base
++COPY --from=exl3-ext /opt/exl3_pkg/ /usr/local/lib/python3.12/dist-packages/
++COPY --from=exl3-ext /opt/exl3/exllamav3_ext.so /opt/exl3/exllamav3_ext.so
++ENV VLLM_EXL3_EXTENSION_DIR=/opt/exl3
+ 
+ ARG PIP_INDEX_URL UV_INDEX_URL
+ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
+@@ -1024,8 +1013,7 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
+ # warm BuildKit agent can skip the install and ship a stale wheel.
+ COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+-    --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
++        if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+         echo "Installing torch nightly..." \
+         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
+         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+@@ -1039,15 +1027,14 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
+     fi
+ 
+ # The vLLM wheel still pins the stable FlashInfer Python package. Restore the
++COPY fi/flashinfer_python-0.6.17-py3-none-any.whl /tmp/flashinfer_python-0.6.17-py3-none-any.whl
+ # release candidate after installing vLLM so it matches the cubin and JIT cache.
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
++RUN     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
+         uv pip install --system --no-deps --reinstall \
+-            "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"; \
++            /tmp/flashinfer_python-0.6.17-py3-none-any.whl; \
+     fi
+ 
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-. /etc/environment && \
++RUN . /etc/environment && \
+ uv pip list
+ 
+ # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
+@@ -1058,8 +1045,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ # and bind-mount the wheel for the actual install to keep it out of the image.
+ COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
+ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
+-    --mount=type=cache,target=/opt/uv/cache \
+-    uv pip install --system ep_kernels/dist/*.whl --verbose \
++        uv pip install --system ep_kernels/dist/*.whl --verbose \
+         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+ 
+ # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
+@@ -1106,8 +1092,7 @@ COPY requirements/test/cuda.txt requirements/test/cuda.txt
+ COPY requirements/dev.txt requirements/dev.txt
+ COPY use_existing_torch.py use_existing_torch.py
+ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
++RUN     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
+     if [ "$CUDA_MAJOR" -ge 12 ]; then \
+         if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+             echo "Installing dev requirements plus torch nightly..." \
+@@ -1149,8 +1134,7 @@ ARG PYTORCH_NIGHTLY
+ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
+ COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+-    --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
++        if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+         echo "Installing torch nightly..." \
+         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
+         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+@@ -1164,10 +1148,9 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
+     fi
+ 
+ # Keep FlashInfer Python aligned with the release-candidate runtime packages.
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
++RUN     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
+         uv pip install --system --no-deps --reinstall \
+-            "https://github.com/flashinfer-ai/flashinfer/releases/download/${FLASHINFER_RELEASE_TAG}/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"; \
++            /tmp/flashinfer_python-0.6.17-py3-none-any.whl; \
+     fi
+ 
+ # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
+@@ -1175,8 +1158,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ 
+ COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
+ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
+-    --mount=type=cache,target=/opt/uv/cache \
+-    uv pip install --system ep_kernels/dist/*.whl --verbose \
++        uv pip install --system ep_kernels/dist/*.whl --verbose \
+         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+ 
+ # See the matching comment in the vllm-base stage.
+@@ -1185,8 +1167,7 @@ ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+ ADD . /vllm-workspace/
+ 
+ # install development dependencies (for testing)
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    uv pip install --system -e tests/vllm_test_utils
++RUN     uv pip install --system -e tests/vllm_test_utils
+ 
+ # enable fast downloads from hf (for testing)
+ ENV HF_XET_HIGH_PERFORMANCE 1
+@@ -1231,8 +1212,7 @@ ENV UV_HTTP_TIMEOUT=500
+ # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
+ ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
+ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
++RUN     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
+     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
+     CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
+     CUDA_HOME=/usr/local/cuda; \
+@@ -1267,8 +1247,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ 
+ # Install Rubin prerelease dependencies when explicitly requested. Keep this
+ # after the public vLLM and KV connector dependency pins installed above.
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
++RUN     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+         echo "Installing Rubin prerelease requirements..." \
+         && uv pip install --system \
+@@ -1281,8 +1260,7 @@ COPY --from=extensions-build \
+     /tmp/triton_from_source_workspace/dist/wheel.sha256 \
+     /tmp/triton-source-wheel.sha256
+ COPY tools/install_triton_from_source.sh /tmp/install_triton_from_source.sh
+-RUN --mount=type=cache,target=/opt/uv/cache \
+-    --mount=type=bind,from=extensions-build,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
++RUN     --mount=type=bind,from=extensions-build,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
+     if [ -n "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
+         CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2); \
+         if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \

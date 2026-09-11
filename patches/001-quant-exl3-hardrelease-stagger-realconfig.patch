@@ -1,0 +1,102 @@
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index d4d0ed3..33e64cb 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -163,6 +163,8 @@ def _exl3_module():
+                 "set VLLM_EXL3_PACKAGE_ROOT"
+             )
+         root = pathlib.Path(next(iter(locations)))
++    if _EXLLAMA_EXT not in sys.path:
++        sys.path.insert(0, _EXLLAMA_EXT)
+     if "exllamav3" not in sys.modules:
+         for name, path in {
+             "exllamav3": root,
+@@ -175,13 +177,18 @@ def _exl3_module():
+             module.__package__ = name
+             module.__path__ = [str(path)]
+             sys.modules[name] = module
+-        config = type(sys)("exllamav3.model.config")
+-        config.__file__ = str(root / "model" / "config.py")
++        # exllamav3 >= 1.4: LinearEXL3 lazily imports NullConfig from
++        # exllamav3.model.config (0.0.43 only needed the dummy Config above).
++        # Load the real config.py from file so the symbol exists; its own
++        # imports (util.rope / loader / util.file) are lightweight and resolve
++        # through the namespace stubs installed above.
++        _cfg_spec = importlib.util.spec_from_file_location(
++            "exllamav3.model.config", root / "model" / "config.py"
++        )
++        config = importlib.util.module_from_spec(_cfg_spec)
+         config.__package__ = "exllamav3.model"
+-        config.Config = type("Config", (), {})
+         sys.modules[config.__name__] = config
+-    if _EXLLAMA_EXT not in sys.path:
+-        sys.path.insert(0, _EXLLAMA_EXT)
++        _cfg_spec.loader.exec_module(config)
+     return importlib.import_module("exllamav3.modules.quant.exl3")
+ 
+ 
+@@ -462,15 +469,35 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         sidecar = _marlin_sidecar_path(layer)
++        _dbg = getattr(layer, "layer_name", "?")
++        # CMP 170HX Gen2 x4: stagger the first sidecar H2D of each PP rank so
++        # the per-rank DMA bursts do not overlap (link-retrain wild writes).
++        import os as _os
++        if not globals().get("_EXL3_STAGGERED"):
++            globals()["_EXL3_STAGGERED"] = True
++            import time as _time
++            from vllm.distributed import get_pp_group as _gpg
++            _rank = _gpg().rank_in_group if _gpg().world_size > 1 else 0
++            _delay = float(_os.environ.get("VLLM_EXL3_H2D_STAGGER_S", "0"))
++            if _delay and _rank:
++                print(f"EXL3PW[{_dbg}] stagger rank={_rank} sleep={_delay*_rank}s", flush=True)
++                _time.sleep(_delay * _rank)
++        print(f"EXL3PW[{_dbg}] entry sidecar={sidecar}", flush=True)
+         if sidecar is not None:
+             from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+                 marlin_make_workspace_new,
+             )
+ 
+             tensors: dict[str, torch.Tensor] = {}
++            # CMP 170HX (PCIe Gen2 x4): concurrent per-rank sidecar H2D bursts
++            # trigger link retrains that surface as async illegal accesses
++            # (same failure family as the Marlin prep on the wtdcode tree).
++            # Serialize the sidecar H2D stage across PP ranks via flock.
+             with safe_open(sidecar, framework="pt", device="cpu") as f:
+-                for name in ("w13_qweight", "w13_scales", "w2_qweight", "w2_scales"):
+-                    tensors[name] = f.get_tensor(name).to(layer.w13_trellis.device)
++                    for name in ("w13_qweight", "w13_scales", "w2_qweight", "w2_scales"):
++                        print(f"EXL3PW[{_dbg}] H2D {name}", flush=True)
++                        tensors[name] = f.get_tensor(name).to(layer.w13_trellis.device)
++            print(f"EXL3PW[{_dbg}] sidecar on gpu, creating workspace", flush=True)
+             self._marlin = (
+                 tensors["w13_qweight"],
+                 tensors["w2_qweight"],
+@@ -479,6 +506,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                 marlin_make_workspace_new(layer.w13_trellis.device, 4),
+                 _marlin_scratch(layer.w13_trellis.device),
+             )
++            print(f"EXL3PW[{_dbg}] workspace done", flush=True)
+             # Release the EXL3 storage for this layer after the sidecar is live.
+             # The parameters remain registered with empty tensors so model
+             # loading/accounting code that inspects their names still works.
+@@ -490,6 +518,18 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                         ),
+                         requires_grad=False,
+                     )
++            # Hard release: some holder keeps the replaced EXL3 tensors alive
++            # past the parameter swap, so the sidecar accumulation OOMs around
++            # MoE layer 8. Force the allocator to actually return the memory.
++            import gc as _gc
++            _gc.collect()
++            torch.cuda.synchronize(layer.w13_trellis.device)
++            torch.cuda.empty_cache()
++            _dev = layer.w13_trellis.device
++            print(
++                f"EXL3PW[{_dbg}] released, alloc={torch.cuda.memory_allocated(_dev)/2**30:.2f}GiB reserved={torch.cuda.memory_reserved(_dev)/2**30:.2f}GiB",
++                flush=True,
++            )
+             return
+         # Construct BC_LinearEXL3 objects only after all four packed tensors are
+         # resident on their final device.  Each wrapper keeps the compressed
