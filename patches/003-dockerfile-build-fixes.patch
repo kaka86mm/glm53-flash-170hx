@@ -1,5 +1,5 @@
 diff --git a/docker/Dockerfile b/docker/Dockerfile
-index 0a1cab7..84a5711 100644
+index 0a1cab7..1865c01 100644
 --- a/docker/Dockerfile
 +++ b/docker/Dockerfile
 @@ -126,6 +126,8 @@ ENV VIRTUAL_ENV="/opt/venv"
@@ -238,10 +238,11 @@ index 0a1cab7..84a5711 100644
          echo "Installing torch nightly..." \
          && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
          --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-@@ -1039,15 +1027,14 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
+@@ -1039,15 +1027,15 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
      fi
  
  # The vLLM wheel still pins the stable FlashInfer Python package. Restore the
++RUN uv pip install --system xxhash -i https://mirrors.aliyun.com/pypi/simple/
 +COPY fi/flashinfer_python-0.6.17-py3-none-any.whl /tmp/flashinfer_python-0.6.17-py3-none-any.whl
  # release candidate after installing vLLM so it matches the cubin and JIT cache.
 -RUN --mount=type=cache,target=/opt/uv/cache \
@@ -258,7 +259,7 @@ index 0a1cab7..84a5711 100644
  uv pip list
  
  # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
-@@ -1058,8 +1045,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+@@ -1058,8 +1046,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
  # and bind-mount the wheel for the actual install to keep it out of the image.
  COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
  RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
@@ -268,7 +269,7 @@ index 0a1cab7..84a5711 100644
          --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
  
  # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
-@@ -1106,8 +1092,7 @@ COPY requirements/test/cuda.txt requirements/test/cuda.txt
+@@ -1106,8 +1093,7 @@ COPY requirements/test/cuda.txt requirements/test/cuda.txt
  COPY requirements/dev.txt requirements/dev.txt
  COPY use_existing_torch.py use_existing_torch.py
  COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
@@ -278,7 +279,7 @@ index 0a1cab7..84a5711 100644
      if [ "$CUDA_MAJOR" -ge 12 ]; then \
          if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
              echo "Installing dev requirements plus torch nightly..." \
-@@ -1149,8 +1134,7 @@ ARG PYTORCH_NIGHTLY
+@@ -1149,8 +1135,7 @@ ARG PYTORCH_NIGHTLY
  COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
  COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
  RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
@@ -288,7 +289,7 @@ index 0a1cab7..84a5711 100644
          echo "Installing torch nightly..." \
          && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
          --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-@@ -1164,10 +1148,9 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
+@@ -1164,10 +1149,9 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
      fi
  
  # Keep FlashInfer Python aligned with the release-candidate runtime packages.
@@ -301,7 +302,7 @@ index 0a1cab7..84a5711 100644
      fi
  
  # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
-@@ -1175,8 +1158,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+@@ -1175,8 +1159,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
  
  COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
  RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
@@ -311,7 +312,7 @@ index 0a1cab7..84a5711 100644
          --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
  
  # See the matching comment in the vllm-base stage.
-@@ -1185,8 +1167,7 @@ ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+@@ -1185,8 +1168,7 @@ ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
  ADD . /vllm-workspace/
  
  # install development dependencies (for testing)
@@ -321,7 +322,7 @@ index 0a1cab7..84a5711 100644
  
  # enable fast downloads from hf (for testing)
  ENV HF_XET_HIGH_PERFORMANCE 1
-@@ -1231,8 +1212,7 @@ ENV UV_HTTP_TIMEOUT=500
+@@ -1231,8 +1213,7 @@ ENV UV_HTTP_TIMEOUT=500
  # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
  ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
  ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
@@ -331,7 +332,7 @@ index 0a1cab7..84a5711 100644
      CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
      CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
      CUDA_HOME=/usr/local/cuda; \
-@@ -1267,8 +1247,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+@@ -1267,8 +1248,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
  
  # Install Rubin prerelease dependencies when explicitly requested. Keep this
  # after the public vLLM and KV connector dependency pins installed above.
@@ -341,7 +342,7 @@ index 0a1cab7..84a5711 100644
      if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
          echo "Installing Rubin prerelease requirements..." \
          && uv pip install --system \
-@@ -1281,8 +1260,7 @@ COPY --from=extensions-build \
+@@ -1281,8 +1261,7 @@ COPY --from=extensions-build \
      /tmp/triton_from_source_workspace/dist/wheel.sha256 \
      /tmp/triton-source-wheel.sha256
  COPY tools/install_triton_from_source.sh /tmp/install_triton_from_source.sh

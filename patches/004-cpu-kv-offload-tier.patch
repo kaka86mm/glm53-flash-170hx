@@ -1,0 +1,315 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+index 70919ce..c65a5bd 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+@@ -51,7 +51,12 @@ def build_offloading_config(
+     )
+ 
+     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+-    for group in groups:
++    # Only prefix-caching-participating groups are hash-addressed; ring-buffer
++    # specs (e.g. KpoolTailSpec, block_size 4) never take prefix hits, so the
++    # divisibility check must not gate on them (upstream over-asserts).
++    for group, orig_group in zip(groups, kv_cache_config.kv_cache_groups):
++        if not orig_group.kv_cache_spec.participates_in_prefix_caching:
++            continue
+         assert group.tokens_per_block % tokens_per_hash == 0, (
+             f"tokens_per_block={group.tokens_per_block} not divisible by "
+             f"tokens_per_hash={tokens_per_hash}. "
+@@ -179,6 +184,7 @@ def build_offloading_config(
+     return OffloadingConfig(
+         groups=groups,
+         worker_kv_bytes_per_block=worker_kv_bytes_per_block,
++        num_cpu_blocks=kv_cache_config.num_cpu_blocks,
+         enable_kv_cache_events=(
+             kv_events_config is not None and kv_events_config.enable_kv_cache_events
+         ),
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index ebc9b87..2238e36 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -242,6 +242,14 @@ class SchedulerOffloadConfig(NamedTuple):
+         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
+             kv_spec = kv_cache_group.kv_cache_spec
++            # Groups excluded from prefix caching (ring-buffer specs like
++            # KpoolTailSpec, block_size 4 under a coarse prefix-match-unit)
++            # have no hash-addressable chunks. Keeping them in the offload
++            # group list makes the hash/chunk arithmetic degenerate; their
++            # blocks simply stay GPU-resident and are recomputed on eviction
++            # (a 1-block ring per request, negligible).
++            if not kv_spec.participates_in_prefix_caching:
++                continue
+             sw = get_sliding_window_size_in_chunks(
+                 kv_spec, tokens_per_block * spec.blocks_per_chunk
+             )
+@@ -503,11 +511,14 @@ class OffloadingConnectorScheduler:
+ 
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+-        for group_config in self.config.kv_group_configs:
++        # Collect POSITIONAL indices into kv_group_configs (the list may be
++        # filtered, so group_idx no longer equals position); _lookup_groups
++        # consumers index the list positionally.
++        for pos, group_config in enumerate(self.config.kv_group_configs):
+             if group_config.sliding_window_size_in_chunks is None:
+-                full_attention_groups.append(group_config.group_idx)
++                full_attention_groups.append(pos)
+             else:
+-                sliding_window_groups.append(group_config.group_idx)
++                sliding_window_groups.append(pos)
+ 
+         # sort sliding window groups by window size in decreasing order
+         def _sliding_window_sort_key(i: int) -> int:
+@@ -523,6 +534,11 @@ class OffloadingConnectorScheduler:
+         self._mamba_align_size: int | None = resolve_mamba_align_size(
+             spec, kv_cache_config
+         )
++        _all_group_count = len(kv_cache_config.kv_cache_groups)
++        _kept = [c.group_idx for c in self.config.kv_group_configs]
++        self._kept_group_positions = (
++            None if len(_kept) == _all_group_count else tuple(_kept)
++        )
+         self._partial_tail_block_size = (
+             self.config.kv_group_configs[0].tokens_per_block
+             if self.config.supports_partial_tail
+@@ -1119,6 +1135,15 @@ class OffloadingConnectorScheduler:
+                     group_state.block_ids.clear()
+ 
+             if new_block_id_groups:
++                # Core supplies block ids for every kv_cache_group; the
++                # connector world may be filtered (non-prefix-caching ring
++                # specs excluded). Project to the kept groups so positional
++                # zip with group_states stays aligned.
++                _keep = self._kept_group_positions
++                if _keep is not None and len(new_block_id_groups) != len(_keep):
++                    new_block_id_groups = tuple(
++                        new_block_id_groups[i] for i in _keep
++                    )
+                 if self._sliding_window_groups:
+                     new_block_ids_end[req_id] = tuple(
+                         len(req_status.group_states[grp_idx].block_ids)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index ecdae9c..af11acf 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -192,7 +192,13 @@ class OffloadingConnectorWorker:
+                     )
+ 
+         group_data_refs: list[list[CanonicalKVCacheRef]] = []
++        # Skip groups excluded from prefix caching (ring-buffer specs such as
++        # KpoolTailSpec under a coarse prefix-match-unit): the scheduler-side
++        # group world filters them out, so the worker must match or the
++        # group_sizes/layer_refs alignment asserts fire.
+         for kv_cache_group in kv_cache_config.kv_cache_groups:
++            if not kv_cache_group.kv_cache_spec.participates_in_prefix_caching:
++                continue
+             group_refs: list[CanonicalKVCacheRef] = []
+             for layer_name in kv_cache_group.layer_names:
+                 group_refs += block_data_refs[layer_name]
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index e31f896..0133737 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -5,6 +5,7 @@
+ import copy
+ import hashlib
+ import math
++import mmap
+ import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator, Sequence
+@@ -2636,6 +2637,142 @@ def _project_kv_cache_groups_to_worker(
+     return projected_groups
+ 
+ 
++def _get_cpu_offload_blocks_per_chunk(
++    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
++) -> int:
++    kv_transfer_config = vllm_config.kv_transfer_config
++    assert kv_transfer_config is not None
++    extra_config = kv_transfer_config.kv_connector_extra_config
++
++    blocks_per_chunk_config = extra_config.get("blocks_per_chunk")
++    tokens_per_chunk = extra_config.get("block_size")
++
++    if blocks_per_chunk_config is not None and tokens_per_chunk is not None:
++        raise ValueError(
++            "Specify only one of 'block_size' or 'blocks_per_chunk' "
++            "in kv_connector_extra_config."
++        )
++
++    if blocks_per_chunk_config is not None:
++        blocks_per_chunk = int(blocks_per_chunk_config)
++        if blocks_per_chunk <= 0:
++            raise ValueError("'blocks_per_chunk' must be greater than 0.")
++        return blocks_per_chunk
++
++    if tokens_per_chunk is None:
++        return 1
++
++    tokens_per_chunk_int = int(tokens_per_chunk)
++    _, tokens_per_block = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
++    assert tokens_per_chunk_int % tokens_per_block == 0
++    return tokens_per_chunk_int // tokens_per_block
++
++
++def _uses_replicated_cpu_offload_layout(
++    vllm_config: VllmConfig,
++    kv_cache_config: KVCacheConfig,
++    worker_kv_bytes_per_block: int,
++) -> bool:
++    parallel_config = vllm_config.parallel_config
++    single_group_spec = (
++        kv_cache_config.kv_cache_groups[0].kv_cache_spec
++        if len(kv_cache_config.kv_cache_groups) == 1
++        else None
++    )
++
++    return (
++        vllm_config.model_config.use_mla
++        and type(single_group_spec) is MLAAttentionSpec
++        and worker_kv_bytes_per_block > 0
++        and worker_kv_bytes_per_block
++        == single_group_spec.page_size_bytes
++        * len(kv_cache_config.kv_cache_groups[0].layer_names)
++        and parallel_config.tensor_parallel_size > 1
++        and parallel_config.pipeline_parallel_size == 1
++        and parallel_config.prefill_context_parallel_size == 1
++        and parallel_config.decode_context_parallel_size == 1
++        and parallel_config.world_size == parallel_config.tensor_parallel_size
++        and parallel_config.distributed_executor_backend == "mp"
++        and parallel_config.nnodes_within_dp == 1
++    )
++
++
++def get_cpu_offload_num_blocks(
++    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
++) -> int:
++    kv_transfer_config = vllm_config.kv_transfer_config
++    assert kv_transfer_config is not None
++
++    cpu_bytes_to_use = kv_transfer_config.kv_connector_extra_config.get(
++        "cpu_bytes_to_use"
++    )
++    if not cpu_bytes_to_use:
++        raise Exception(
++            "cpu_bytes_to_use must be specified in kv_connector_extra_config"
++        )
++
++    worker_kv_bytes_per_block = 0
++    if kv_cache_config.num_blocks > 0:
++        packed_tensors = tuple(
++            bool(tensor.block_stride) for tensor in kv_cache_config.kv_cache_tensors
++        )
++        is_packed = any(packed_tensors)
++        assert not is_packed or all(packed_tensors)
++        total_gpu_kv_bytes = (
++            kv_cache_config.kv_cache_tensors[0].size
++            if is_packed
++            else sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
++        )
++        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
++
++    world_size = vllm_config.parallel_config.world_size
++    if worker_kv_bytes_per_block <= 0 or world_size <= 0:
++        return 0
++
++    num_copies = (
++        1
++        if _uses_replicated_cpu_offload_layout(
++            vllm_config, kv_cache_config, worker_kv_bytes_per_block
++        )
++        else world_size
++    )
++    kv_bytes_per_block = worker_kv_bytes_per_block * num_copies
++    kv_bytes_per_chunk = (
++        kv_bytes_per_block
++        * _get_cpu_offload_blocks_per_chunk(vllm_config, kv_cache_config)
++    )
++    aligned_kv_bytes_per_chunk = round_up(kv_bytes_per_chunk, mmap.PAGESIZE)
++    return int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
++
++
++def _uses_cpu_offloading_spec(vllm_config: VllmConfig) -> bool:
++    kv_transfer_config = vllm_config.kv_transfer_config
++    if (
++        kv_transfer_config is None
++        or kv_transfer_config.kv_connector != "OffloadingConnector"
++    ):
++        return False
++
++    spec_name = kv_transfer_config.kv_connector_extra_config.get(
++        "spec_name", "CPUOffloadingSpec"
++    )
++    return spec_name == "CPUOffloadingSpec"
++
++
++def _unify_cpu_offload_num_blocks(
++    vllm_config: VllmConfig, kv_cache_configs: list[KVCacheConfig]
++) -> None:
++    if not _uses_cpu_offloading_spec(vllm_config):
++        return
++
++    min_num_cpu_blocks = min(
++        get_cpu_offload_num_blocks(vllm_config, kv_cache_config)
++        for kv_cache_config in kv_cache_configs
++    )
++    for kv_cache_config in kv_cache_configs:
++        kv_cache_config.num_cpu_blocks = min_num_cpu_blocks
++
++
+ def get_kv_cache_configs(
+     vllm_config: VllmConfig,
+     kv_cache_specs: list[dict[str, KVCacheSpec]],
+@@ -2660,6 +2797,8 @@ def get_kv_cache_configs(
+        different PP stages are similar.)
+     5. Change the num_blocks of each worker to the smallest among all workers
+        and shrink tensor sizes proportionally to avoid allocating unused memory.
++    6. If native CPU offloading is enabled, set the CPU offload num_blocks to
++       the smallest value supported by any worker.
+ 
+     Args:
+         vllm_config: The global VllmConfig
+@@ -2773,6 +2912,7 @@ def get_kv_cache_configs(
+             )
+         )
+ 
++    _unify_cpu_offload_num_blocks(vllm_config, kv_cache_configs)
+     # Change the num_blocks of each rank to the smallest among all ranks.
+     # We also need to shrink the tensor size proportionally to avoid
+     # allocating unused memory.
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 29033a9..5d69144 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -994,7 +994,6 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
+     sliding window attentions with different window sizes are not the same type
+     and should not be merged into one UniformTypeKVCacheSpecs.
+     """
+-
+     kv_cache_specs: dict[str, KVCacheSpec]
+ 
+     @property
+@@ -1211,6 +1210,8 @@ class KVCacheConfig:
+     """
+     prefix_cache_retention_interval: int | None = None
+     """Resolved retention policy for local prefix-cache checkpoints."""
++    num_cpu_blocks: int | None = None
++    """The unified number of CPU offload blocks, if CPU offloading is enabled."""
+     kv_cache_layout: str | None = None
+     """The KV cache layout resolved by the engine core, adopted by all workers."""
+ 
+diff --git a/vllm/v1/kv_offload/config.py b/vllm/v1/kv_offload/config.py
+index 637d3bb..7aec375 100644
+--- a/vllm/v1/kv_offload/config.py
++++ b/vllm/v1/kv_offload/config.py
+@@ -75,6 +75,8 @@ class OffloadingConfig:
+     model: OffloadingModelConfig
+     cache: OffloadingCacheConfig
+     parallel: OffloadingParallelConfig
++    # Unified number of CPU offload blocks across all workers, if precomputed.
++    num_cpu_blocks: int | None = None
+     # True when the offloaded bytes of every worker are expected to be
+     # byte-identical per block (pure-MLA model, single-node TP-only
+     # parallelism), enabling a single-copy host layout in backends that

@@ -70,3 +70,36 @@ needle（深度 50%）经生产网关：64k/128k/256k 全 PASS；256k 深度 95%
 
 0.95/0.96 加载与长 prefill 期随机越界写入；**0.94 为生产上限**（v10+硬释放后可达）；
 0.90–0.92 保守档。
+
+---
+
+## v16：CPU KV 卸载层（OffloadingConnector + 128 GiB /dev/shm）
+
+配置变更：`--kv-transfer-config OffloadingConnector kv_both (blocks_per_chunk 4, cpu_bytes_to_use 128GiB)` + `--enable-prefix-caching --prefix-caching-hash-algo xxhash --prefix-match-unit 4` + `--max-num-seqs 8 --max-num-batched-tokens 2048`；`expandable_segments` 移除（与 mmap 卸载不兼容）。
+
+| 指标 | v10（GPU-only） | v16（+CPU 层） |
+|---|---|---|
+| KV 池 | 153.4 万 token | **≈450 万**（GPU 158 万 + CPU ~300 万） |
+| 并发 467K 驻留 | 3 路 | **4/4 检索全 PASS** |
+| 长文 prefill（131k） | 3,926 tok/s | 2,073–2,369（细哈希+卸载簿记成本） |
+| warm 前缀命中 prefill | — | 64k 达 14,670 tok/s |
+| 解码/并发 | 基准 | 持平（json 97.8 / code 73.9 / N8 ≈200） |
+
+结论：用 30–50% 冷长文 prefill 换 3 倍 KV 容量与 warm 前缀加速；agent 多轮会话（共享前缀）形态净收益为正。prefix-match-unit 取 4（各注意力组 block 尺寸的 GCD，576 全宽对齐需上游 group-exclusion 特性，见 v17–v21 归档）。
+
+## v22：/dev/shm 崩溃安全 + adaptive-k
+
+**补丁 005（上游 PR #52596 移植）**：SharedOffloadRegion 增加 barrier（gloo 世界组），全部 PP rank mmap 完成后 creator unlink 文件名。SIGKILL/崩溃零残留，消除"陈旧 137 GB mmap 卡死下次启动"故障类；启动日志出现 `Unlinked mmap file` 为生效标志。
+
+**补丁 006（MiaAI-Lab 移植，AGPL-3.0）**：adaptive-k DFlash2。调度器按每请求 EMA（observe→batch_k，异步调度路径）在候选集内选每步验证前缀；cudagraph 按候选 k+1 补捕 uniform decode 图。基准为流式真解码速率（`bench/agent_ab.py` 单流 / `bench/agent_conc.py` 并发；首末 delta 时间戳法，±1% 复测一致性；旧的墙钟扣减法在同场景方差 ±75% 已弃用）：
+
+| 场景（48k 上下文 agent 型推理任务，加盐冷前缀） | k=7 固定 | adaptive {4,7} α0.15 m1.0 |
+|---|---|---|
+| 6 路并发聚合 | 232–238 tok/s | **262–267（+12~13%）** |
+| 单流 32k | 44.9 | 48.4（+8%） |
+| 单流 128k | 46.8 | 45.1（−4%） |
+| 短文单流（json/counting 等） | 基准 | −1~4% |
+
+机理：单流时解码步为纯延迟瓶颈（步率 13.1–13.3 步/s 与 k 无关，verify token 边际成本≈0，砍 k 只丢接受率）；≥6 并发时 verify 进入算力瓶颈，砍掉 prose 死槽位（slot 5–7 逐位接受率 0.06–0.12）换吞吐净赚。生产档 `{4,7} α0.15 margin=1.0`；调参经 {2,4,7}/{4,7}×α0.15/0.25×m0.5/1.0/2.0 全网格选优。运行时热切换：容器内 `/root/.cache/vllm/glm53_adaptive_k.json`（每 50 步检查 mtime；**缺省字段继承上次值**，`set` 只能取启动集子集；改后需 ≥50 步再核对 `reloaded` 日志）。
+
+功能回归（v22 生产实测）：tool-call（glm47 parser）✓、thinking 分离（`reasoning` 字段独立，content 无泄漏）✓、needle 128k ✓。

@@ -1,0 +1,197 @@
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index 75bea4e..746b279 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -71,7 +71,10 @@ class SharedOffloadRegion:
+     the rest open the existing file and wait until it reaches the expected
+     size.  Each worker then mmap()s the full file.
+ 
+-    File path: /dev/shm/vllm_offload_{engine_id}.mmap
++    File path: /dev/shm/vllm_offload_{engine_id}.mmap.  When a barrier is
++    given, the path is unlinked once every worker has mapped the file, so
++    the kernel reclaims the memory when the last worker exits, no matter
++    how it exits; mappings taken before the unlink stay valid.
+     """
+ 
+     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
+@@ -83,6 +86,7 @@ class SharedOffloadRegion:
+         rank: int | None,
+         kv_bytes_per_block: int,
+         cpu_page_size: int,
++        barrier: Callable[[], None] | None = None,
+     ) -> None:
+         self.page_size = mmap.PAGESIZE
+         assert kv_bytes_per_block % self.page_size == 0
+@@ -100,44 +104,89 @@ class SharedOffloadRegion:
+             # exclusive upper bound for this worker's area within each row
+             self._worker_area_end = (rank + 1) * cpu_page_size
+         try:
+-            self.fd: int | None = os.open(
+-                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
++            try:
++                self.fd: int | None = os.open(
++                    self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
++                )
++            except FileExistsError:
++                # Joiner path — another worker won O_EXCL. Reopen and wait
++                # for the file to reach expected size.
++                self.fd = os.open(self.mmap_path, os.O_RDWR)
++                try:
++                    _wait_for_file_size(self.fd, self.total_size_bytes)
++                except (TimeoutError, OSError):
++                    os.close(self.fd)
++                    raise
++                logger.info("Opened existing mmap file %s", self.mmap_path)
++            else:
++                # Creator path. We won O_EXCL, so we own the file: any
++                # failure here must clean up so concurrent joiners don't
++                # land on a 0-byte stub and spin in _wait_for_file_size
++                # for the full 30 s timeout.
++                # PP-heterogeneous ranks share this file but compute different
++                # total_size_bytes (num_blocks x own row_stride). The creator must
++                # size the file to at least the largest rank expectation, else
++                # joiners with a bigger product spin in _wait_for_file_size.
++                import os as _os
++                _min_bytes = int(
++                    _os.environ.get("VLLM_OFFLOAD_MMAP_MIN_BYTES", "0")
++                )
++                _file_bytes = max(self.total_size_bytes, _min_bytes)
++                try:
++                    check_shm_free_space(_file_bytes)
++                    os.ftruncate(self.fd, _file_bytes)
++                except (RuntimeError, OSError):
++                    os.unlink(self.mmap_path)
++                    os.close(self.fd)
++                    raise
++                self._creator = True
++                logger.info(
++                    "Created mmap file %s (%.2f GB)",
++                    self.mmap_path,
++                    self.total_size_bytes / 1e9,
++                )
++
++            self.mmap_obj: mmap.mmap | None = mmap.mmap(
++                self.fd,
++                self.total_size_bytes,
++                flags=mmap.MAP_SHARED,
++                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+             )
+-        except FileExistsError:
+-            # Joiner path — another worker won O_EXCL. Reopen and wait
+-            # for the file to reach expected size.
+-            self.fd = os.open(self.mmap_path, os.O_RDWR)
++        except Exception:
++            if self._creator:
++                os.unlink(self.mmap_path)
++                self._creator = False
++            # Peers block inside the barrier until the collective times out if
++            # we die before reaching it.  Arrive anyway so every worker calls
++            # barrier() exactly once and they fail on their own errors instead
++            # of hanging; a failure here must not replace ours.
++            if barrier is not None:
++                try:
++                    barrier()
++                except Exception:
++                    logger.warning(
++                        "Failed to release peers waiting at the mmap barrier",
++                        exc_info=True,
++                    )
++            raise
++
++        if barrier is not None:
++            # Every worker has mapped the file once the barrier releases, so
++            # its name is no longer needed and dropping it here means no exit
++            # path — including SIGKILL — can leak the file.
+             try:
+-                _wait_for_file_size(self.fd, self.total_size_bytes)
+-            except (TimeoutError, OSError):
++                barrier()
++            except Exception:
++                if self._creator:
++                    os.unlink(self.mmap_path)
++                    self._creator = False
++                self.mmap_obj.close()
+                 os.close(self.fd)
+                 raise
+-            logger.info("Opened existing mmap file %s", self.mmap_path)
+-        else:
+-            # Creator path. We won O_EXCL, so we own the file: any
+-            # failure here must clean up so concurrent joiners don't
+-            # land on a 0-byte stub and spin in _wait_for_file_size
+-            # for the full 30 s timeout.
+-            try:
+-                check_shm_free_space(self.total_size_bytes)
+-                os.ftruncate(self.fd, self.total_size_bytes)
+-            except (RuntimeError, OSError):
++            if self._creator:
+                 os.unlink(self.mmap_path)
+-                os.close(self.fd)
+-                raise
+-            self._creator = True
+-            logger.info(
+-                "Created mmap file %s (%.2f GB)",
+-                self.mmap_path,
+-                self.total_size_bytes / 1e9,
+-            )
+-
+-        self.mmap_obj: mmap.mmap | None = mmap.mmap(
+-            self.fd,
+-            self.total_size_bytes,
+-            flags=mmap.MAP_SHARED,
+-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+-        )
++                self._creator = False
++                logger.info("Unlinked mmap file %s", self.mmap_path)
+ 
+         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+ 
+diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+index 6915a82..562338d 100644
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -24,6 +24,23 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ 
+ 
++def _all_workers_barrier() -> None:
++    """Block until every worker rank has reached this point (gloo cpu group).
++
++    A superset of the node-local mmap openers suffices: once the barrier
++    releases, every worker sharing the region file has mapped it."""
++    from vllm.distributed.parallel_state import (
++        get_inner_dp_world_group,
++        get_world_group,
++    )
++
++    try:
++        group = get_inner_dp_world_group()
++    except AssertionError:
++        group = get_world_group()
++    group.barrier()
++
++
+ class CPUOffloadingSpec(OffloadingSpec):
+     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+ 
+@@ -100,7 +117,12 @@ class CPUOffloadingSpec(OffloadingSpec):
+             aligned_kv_bytes_per_chunk = round_up(
+                 kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
+             )
+-            self.num_blocks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
++            computed_num_blocks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
++            self.num_blocks = (
++                config.num_cpu_blocks
++                if config.num_cpu_blocks is not None
++                else computed_num_blocks
++            )
+ 
+             # Expose aligned_kv_bytes_per_chunk as
+             # kv_bytes_per_chunk. Note that this might contain
+@@ -165,6 +187,7 @@ class CPUOffloadingSpec(OffloadingSpec):
+                 rank=rank,
+                 kv_bytes_per_block=self.kv_bytes_per_chunk,
+                 cpu_page_size=self.cpu_page_size_per_worker,
++                barrier=_all_workers_barrier,
+             )
+         try:
+             return CPUOffloadingWorker(
