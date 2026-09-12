@@ -103,3 +103,7 @@ needle（深度 50%）经生产网关：64k/128k/256k 全 PASS；256k 深度 95%
 机理：单流时解码步为纯延迟瓶颈（步率 13.1–13.3 步/s 与 k 无关，verify token 边际成本≈0，砍 k 只丢接受率）；≥6 并发时 verify 进入算力瓶颈，砍掉 prose 死槽位（slot 5–7 逐位接受率 0.06–0.12）换吞吐净赚。生产档 `{4,7} α0.15 margin=1.0`；调参经 {2,4,7}/{4,7}×α0.15/0.25×m0.5/1.0/2.0 全网格选优。运行时热切换：容器内 `/root/.cache/vllm/glm53_adaptive_k.json`（每 50 步检查 mtime；**缺省字段继承上次值**，`set` 只能取启动集子集；改后需 ≥50 步再核对 `reloaded` 日志）。
 
 功能回归（v22 生产实测）：tool-call（glm47 parser）✓、thinking 分离（`reasoning` 字段独立，content 无泄漏）✓、needle 128k ✓。
+
+## store_threshold=2（v22+，冷 prefill A/B）
+
+`kv_connector_extra_config.store_threshold=2`：块被提供两次才写入 CPU 层（一次性上下文不再付存储税，多轮 agent 前缀第二轮入层）。冷 prefill 空池 A/B（122k 加盐 ×2-4 次）：threshold=0 ≈ 2,079 tok/s vs threshold=2 ≈ 1,990 tok/s 中位——打平（噪声内，低样本与后台下载的磁盘竞争相关）。**保留开启**：满池稳态下存储/淘汰税才是主要成本（池压下同负载曾观测 1,256 tok/s），且减少一次性上下文的 CPU 层churn。验证：`kv_offload_stores_skipped` 计数器活跃。
