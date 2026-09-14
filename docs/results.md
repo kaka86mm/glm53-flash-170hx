@@ -107,3 +107,30 @@ needle（深度 50%）经生产网关：64k/128k/256k 全 PASS；256k 深度 95%
 ## store_threshold=2（v22+，冷 prefill A/B）
 
 `kv_connector_extra_config.store_threshold=2`：块被提供两次才写入 CPU 层（一次性上下文不再付存储税，多轮 agent 前缀第二轮入层）。冷 prefill 空池 A/B（122k 加盐 ×2-4 次）：threshold=0 ≈ 2,079 tok/s vs threshold=2 ≈ 1,990 tok/s 中位——打平（噪声内，低样本与后台下载的磁盘竞争相关）。**保留开启**：满池稳态下存储/淘汰税才是主要成本（池压下同负载曾观测 1,256 tok/s），且减少一次性上下文的 CPU 层churn。验证：`kv_offload_stores_skipped` 计数器活跃。
+
+---
+
+## v24（生产现行，2026-09-14 定档）：FULL 图 + greedy drafting + strided KDA + 编译缓存
+
+配置变更 vs v22：`cudagraph_mode=FULL_AND_PIECEWISE`（capture 列表扩至 64、util 0.94→0.93）、DFlash2 `draft_sample_method=greedy`、补丁 007（strided KDA 递归输入）、Triton/vLLM 编译缓存持久化挂载（`vllm_caches/{triton,vllm}`）、host `performance` governor。
+
+### 全口径对比（同机同负载实测，v22 档案 vs v24）
+
+| 指标 | v22 | v24 | 提升 |
+|---|---|---|---|
+| C1 counting / json | 94.6-102.6 / 96.8-100.7 | **158-163 / 158-161** | +58% / +62% |
+| C1 code / prose | 62.6-70.6 / 21.8-23.7 | **96-100 / 40-42** | +48% / +78% |
+| C1 math | 38.4-43.0 | **67-86** | +75% |
+| 单流长文 32k / 128k | 47-48 / 42-45 | **69-70 / 68-70** | +47% / +55% |
+| N4 / N8 聚合 | 153 / 185-213 | **199 / 241-256** | +30% / +20-37% |
+| 6×48k agent 型聚合 | 262-267 | **265-272** | +1~2% |
+| 冷 prefill 122k | 2,078-2,084 | **2,077** | 持平 |
+| 热启动 | 15-16 min | **9.3 min** | -40% |
+| 质量/稳定 | 全绿 | 全绿（0 错误/0 NaN） | ✓ |
+
+归因备注：单流提升主力是 FULL 图模式（PP4 的逐层 Python 派发瓶颈消除，与 zebgop-ops 同硬件观察一致）；greedy drafting 对 temp-0 流量增益明确。
+
+### 实测否决项（重要负结果，防止重蹈）
+
+- **`-lgc` 锁频是负优化**：锁 1140-1455 时 counting 79 tok/s，解锁后 158-163（同实例干净归因）。本机 DVFS 解锁优于锁频；governor=performance 保留。
+- **NCCL `Ring/Simple` 钉死在 PP 拓扑上有害无益**：FULL 图在 PP4 无钉死稳定回放（钉死药方属 TP allreduce 场景）；`PROTO=Simple` 令 16MB 级 PP 隐状态传输变慢，造成冷 prefill -7~15%，移除后 prefill 回 2,077 且 decode 全保持。

@@ -5,13 +5,18 @@ multimodal) on four NVIDIA CMP 170HX GPUs (SM80, PCIe Gen2 x4, no P2P/NVLink):
 
 - Pipeline parallelism 4 (PP4); TP is not viable on this interconnect
 - EXL3 4bpw weights with offline-generated Marlin INT4 decode sidecar
-- DFlash2 speculative decoding, k=7, with adaptive verification length
-  ({4,7} EMA profile): +12–13% aggregate decode at 6-way concurrent
-  long-context load
+- DFlash2 speculative decoding, k=7, greedy drafting, with adaptive
+  verification length ({4,7} EMA profile)
+- FULL_AND_PIECEWISE CUDA graphs covering the whole decode step on Ampere
+  (PP4) — the single largest decode lever on this rig
+- Strided KDA recurrent inputs (port of vLLM PR #55736): decode KDA consumes
+  merged-projection column slices in place, no per-layer packing copies
 - 512K context window; KV cache tiered across GPU HBM (~1.58M tokens) and a
   128 GiB pinned /dev/shm CPU tier (~3M tokens) — ~4.5M tokens total
 - Crash-safe CPU KV offload region: the backing mmap is unlinked after all
   pipeline ranks map it, so a SIGKILL or wedge cannot leak /dev/shm files
+- Persistent Triton/vLLM compile caches across container restarts
+  (warm start 15-16 min -> 9.3 min)
 - Docker-based build and deployment
 
 This repository is a deployment overlay for
@@ -24,19 +29,24 @@ throughput by 5–8×.
 
 ## Results (4× CMP 170HX 64 GB, 200 W power cap)
 
-| Metric | Value |
-|---|---|
-| Prefill throughput (cold) | 2.0k–2.4k tok/s with the CPU KV tier enabled (16k: 2,040; 131k: 2,073–2,369); 3.9k @131k without offloading |
-| Prefill throughput (warm prefix hit) | up to 14.7k tok/s (64k shared prefix, prefix caching + CPU tier) |
-| Single-stream decode | json 97.8 / code 73.9 / math 41–51 / prose 23.7 tok/s |
-| Aggregate decode | N1=54 / N4=153 / N8=185–213 / N16=188 tok/s |
-| 6-way concurrent long-context decode | 232–238 tok/s fixed k=7 → **262–267 tok/s with adaptive-k** (+12–13%) |
-| Speculative acceptance length | up to 8.0/8 (DFlash2 k=7; saturated on json/counting) |
-| Streaming latency | TTFT 0.4 s (short prompt); ITL mean 66 ms, p95 70 ms |
-| Long context | needle retrieval at 64k/128k/256k (95% depth) all pass; 4× 467K requests resident simultaneously |
-| Max output | 64K tokens (24K continuous generation verified at 31 tok/s) |
-| KV cache pool | ~4.5M tokens: 1.58M GPU + ~3M in the 128 GiB CPU tier |
-| Production acceptance | quality 6/6, tool calling, reasoning separation, vision, 8-way 6-minute soak with 0 errors |
+| Metric | v22 (prior) | v24 (current) |
+|---|---|---|
+| Prefill throughput (cold, 131k) | 2,078–2,084 tok/s | 2,077 tok/s (parity) |
+| Prefill throughput (warm prefix hit) | up to 14.7k tok/s @64k | unchanged mechanism |
+| Single-stream decode C1 | json 97 / code 63–71 / prose 22–24 tok/s | **json 158–161 / code 96–100 / prose 40–42 / counting 158–163 tok/s** |
+| Single-stream long-context decode | 47–48 @32k / 42–45 @128k | **69–70 @32k / 68–70 @128k** |
+| Aggregate decode | N4=153 / N8=185–213 | **N4=199 / N8=241–256** |
+| 6-way concurrent long-context decode | 262–267 tok/s | **265–272 tok/s** |
+| Speculative acceptance length | up to 8.0/8 (DFlash2 k=7) | unchanged |
+| Long context | needle 64k/128k/256k pass; 4× 467K resident | unchanged |
+| KV cache pool | ~4.5M tokens (1.58M GPU + ~3M CPU tier) | unchanged (util 0.93) |
+| Warm restart | 15–16 min | **9.3 min** (persistent compile caches) |
+| Production acceptance | quality 6/6, tools, reasoning, vision, 0-error soak | re-verified on v24 (0 errors / 0 NaN) |
+
+Tested and rejected on this rig (documented so nobody retries blind): `-lgc`
+clock locking (79 vs 158 tok/s counting, unlocked DVFS wins); NCCL
+`Ring/Simple` pinning (unnecessary for FULL graphs under PP; `PROTO=Simple`
+slowed 16 MB PP hidden-state transfers, costing 7–15% cold prefill).
 
 Reference points on identical hardware: an NVFP4 stack (prefill 3.7k tok/s,
 single-stream 36–44 tok/s, unstable beyond 64K context) and an AWQ stack without
@@ -58,7 +68,7 @@ doubling decode/concurrency throughput and extending the context window to 512K.
 ## Repository layout
 
 ```
-patches/    Six diffs against upstream HEAD (apply in numbered order).
+patches/    Seven diffs against upstream HEAD (apply in numbered order).
             006 is AGPL-3.0 (see License); the rest are Apache-2.0.
 deploy/     build.sh (image build), launch_exl3.sh (serving),
             lanes2.sh (sidecar generation across 4 GPUs)
@@ -75,7 +85,8 @@ docs/       results.md — full benchmark tables
 git clone https://github.com/hyd998877/vllm_170hx_glm53-flash-exl3-optimized.git
 cd vllm_170hx_glm53-flash-exl3-optimized
 git apply ../patches/001-*.patch ../patches/002-*.patch ../patches/003-*.patch \
-          ../patches/004-*.patch ../patches/005-*.patch ../patches/006-*.patch
+          ../patches/004-*.patch ../patches/005-*.patch ../patches/006-*.patch \
+          ../patches/007-*.patch
 
 # 2) Build the image (first build ~5 h on 28 cores)
 #    The Dockerfile installs the flashinfer 0.6.17 wheel from a local copy
@@ -188,6 +199,25 @@ All modifications are diffs against upstream HEAD and are contained in
    the local `VLLM_OFFLOAD_MMAP_MIN_BYTES` floor (the creator sizes the file
    to at least the largest rank's expectation, required for heterogeneous
    PP rank layouts).
+
+10. **v24 decode speed pack (patches + configuration)**
+    - Patch 007 (port of vLLM PR #55736): the fused KDA recurrent kernel walks
+      q/k/v/beta by token stride, so decode consumes merged-projection column
+      slices in place instead of four per-layer per-step packing copies; the
+      output buffer is allocated dense because the kernel writes o densely.
+    - `cudagraph_mode=FULL_AND_PIECEWISE` with a capture list up to 64
+      tokens: under FULL_DECODE_ONLY only the smallest decode batches replay
+      graphs, larger batches run eager and the PP stage pipeline becomes
+      CPU-dispatch-bound. No NCCL pinning: FULL graphs replay stably on PP4
+      without it (and PROTO=Simple slows large PP sends).
+    - DFlash2 `draft_sample_method=greedy`: at temperature 0 greedy drafts pin
+      draft probability to 1, making the probabilistic ratio test strictly
+      easier to pass.
+    - Persistent compile caches (`/root/.triton`, `/root/.cache/vllm`)
+      mounted from the host: warm restarts skip Triton JIT and inductor
+      compilation.
+    Combined effect on this rig: +48-80% single-stream decode, +20-37% N8
+    aggregate, cold prefill parity, warm restart 15-16 -> 9.3 min.
 
 9. **Adaptive verification length for DFlash2 (patch 006, AGPL-3.0, ported
    from MiaAI-Lab)**
