@@ -134,3 +134,25 @@ needle（深度 50%）经生产网关：64k/128k/256k 全 PASS；256k 深度 95%
 
 - **`-lgc` 锁频是负优化**：锁 1140-1455 时 counting 79 tok/s，解锁后 158-163（同实例干净归因）。本机 DVFS 解锁优于锁频；governor=performance 保留。
 - **NCCL `Ring/Simple` 钉死在 PP 拓扑上有害无益**：FULL 图在 PP4 无钉死稳定回放（钉死药方属 TP allreduce 场景）；`PROTO=Simple` 令 16MB 级 PP 隐状态传输变慢，造成冷 prefill -7~15%，移除后 prefill 回 2,077 且 decode 全保持。
+
+## 已知问题修复：CPU KV 卸载在 preempt/abort 路径崩溃（patch 008，2026-09-16）
+
+**症状**：客户端中途取消/网关超时（或并发突发准入触发连接器内部 preemption）时，引擎在
+`transfer_async` 的 `assert len(group_sizes) == len(self.layer_refs_per_group)` 上崩溃（7 != 8），
+容器退出；放宽该断言后崩溃点上移到调用方 `assert success`。
+
+**根因**：调度器侧的组视图来自全局 `kv_cache_config.kv_cache_groups`，而 worker 侧
+`layer_refs_per_group` 来自本 rank 的实际层缓存——PP 异构混合模型上最后一个 rank 的组数
+可以多 1（PR #50653 只统一了块数，没统一组结构）。preempt/abort 构造的 store spec 带 7 组，
+撞上初始化为 8 组的 worker。
+
+**修复（防御式，两层）**：`transfer_async` 组数不匹配 → 带计数的警告 + `return False`；
+connector 侧三处提交循环（handle_preemptions 的 store、start_kv_transfers 的 store 与 load）
+收到 False → 警告 + `mark_completed(job_id)` 丢弃（沿用同函数 non-writer 路径的先例）。
+`wait()` 不会挂起（`_transfer_events.get()` 跳过未知 id）。被丢弃的仅是被抢占/中止请求的
+一个存储块——CPU 层少一块、后续重算，无害。
+
+**给部署者的提示**：该修复让引擎不再死于该路径，但每次触发会有一条
+`kv_offload ... dropped: submit refused` 警告日志——它是组视图分歧的现成遥测，
+出现频繁时值得把日志发回来做组结构层面的根治。运行时验证（abort 压测复现脚本见
+issue 引用）待下一个维护窗口执行；本补丁经代码级推演 + 与报告者分析互证。

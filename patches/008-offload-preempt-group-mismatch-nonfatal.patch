@@ -1,0 +1,107 @@
+# Fixes a production-killing crash reported by an operator running this
+# repo's v24 config (thanks for the excellent repro + analysis):
+# client-abort/preempt paths build a store spec against the engine-wide KV
+# group view while a PP rank's worker was initialized from its own layer
+# caches (7 != 8 groups on the last rank) -> AssertionError in transfer_async
+# -> engine exit. This patch makes refused transfers non-fatal at both levels
+# (transfer_async returns False with a diagnostic warning; the connector-side
+# submission loops drop the job via mark_completed, mirroring the existing
+# non-writer path). wait() is safe: _transfer_events.get() skips unknown ids.
+# Losing one store chunk for a preempted/aborted request is harmless.
+# Apache-2.0.
+#
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index ecdae9c..5bf94f4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -192,7 +192,13 @@ class OffloadingConnectorWorker:
+                     )
+ 
+         group_data_refs: list[list[CanonicalKVCacheRef]] = []
++        # Skip groups excluded from prefix caching (ring-buffer specs such as
++        # KpoolTailSpec under a coarse prefix-match-unit): the scheduler-side
++        # group world filters them out, so the worker must match or the
++        # group_sizes/layer_refs alignment asserts fire.
+         for kv_cache_group in kv_cache_config.kv_cache_groups:
++            if not kv_cache_group.kv_cache_spec.participates_in_prefix_caching:
++                continue
+             group_refs: list[CanonicalKVCacheRef] = []
+             for layer_name in kv_cache_group.layer_names:
+                 group_refs += block_data_refs[layer_name]
+@@ -226,7 +232,20 @@ class OffloadingConnectorWorker:
+         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+             assert isinstance(src_spec, GPULoadStoreSpec)
+             success = self.worker.submit_store(job_id, src_spec, dst_spec)
+-            assert success
++            if not success:
++                # A refused store (e.g. a spec whose group count does not match
++                # this rank's layer groups on heterogeneous-PP hybrids) must
++                # drop the job, not kill the engine: the CPU tier simply loses
++                # one chunk for a request that is being preempted/aborted.
++                # worker.wait() skips unknown ids, and mark_completed keeps
++                # the connector-side bookkeeping consistent (same treatment
++                # as the non-writer path above).
++                logger.warning(
++                    "kv_offload store job %d dropped: submit refused "
++                    "(likely group-count mismatch on this rank)", job_id,
++                )
++                self._connector_worker_meta.mark_completed(job_id)
++                continue
+         self._unsubmitted_store_jobs.clear()
+ 
+         if kv_connector_metadata.jobs_to_flush:
+@@ -236,14 +255,27 @@ class OffloadingConnectorWorker:
+         assert self.worker is not None
+         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+             success = self.worker.submit_store(job_id, src_spec, dst_spec)
+-            assert success
++            if not success:
++                logger.warning(
++                    "kv_offload store job %d dropped: submit refused "
++                    "(likely group-count mismatch on this rank)", job_id,
++                )
++                self._connector_worker_meta.mark_completed(job_id)
++                continue
+         self._unsubmitted_store_jobs.clear()
+ 
+         for job_id, entry in metadata.load_jobs.items():
+             self._load_jobs[job_id] = entry.req_id
+             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
+-            assert success
++            if not success:
++                # Same defensive treatment as stores: a refused load means the
++                # request recomputes instead of hitting the CPU tier.
++                logger.warning(
++                    "kv_offload load job %d dropped: submit refused "
++                    "(likely group-count mismatch on this rank)", job_id,
++                )
++                self._connector_worker_meta.mark_completed(job_id)
+ 
+     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
+         for job_id, entry in metadata.store_jobs.items():
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index d2625c2..493543c 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -546,7 +546,19 @@ class SingleDirectionOffloadingHandler:
+         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
+         assert isinstance(gpu_spec, GPULoadStoreSpec)
+         group_sizes = gpu_spec.group_sizes
+-        assert len(group_sizes) == len(self.layer_refs_per_group)
++        if len(group_sizes) != len(self.layer_refs_per_group):
++            # Heterogeneous-PP hybrids can build specs against the engine-wide
++            # group view while this rank's worker was initialized from its own
++            # layer caches (e.g. 7 vs 8 groups on the last rank). Positional
++            # group alignment is ambiguous, so refuse the transfer rather than
++            # copying blocks into the wrong groups; the connector side drops
++            # the job with a warning instead of crashing the engine.
++            logger.warning(
++                "kv_offload transfer refused: group count mismatch "
++                "%d != %d (spec vs this rank's layer groups)",
++                len(group_sizes), len(self.layer_refs_per_group),
++            )
++            return False
+ 
+         # extract block indices from the GPU spec
+         block_indices = gpu_spec.block_indices
