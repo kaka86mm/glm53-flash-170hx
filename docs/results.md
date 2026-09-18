@@ -156,3 +156,47 @@ connector 侧三处提交循环（handle_preemptions 的 store、start_kv_transf
 `kv_offload ... dropped: submit refused` 警告日志——它是组视图分歧的现成遥测，
 出现频繁时值得把日志发回来做组结构层面的根治。运行时验证（abort 压测复现脚本见
 issue 引用）待下一个维护窗口执行；本补丁经代码级推演 + 与报告者分析互证。
+
+## 根治：CPU KV 卸载组视图失配（patch 010，2026-09-18，v28 生产）
+
+**症状链（比 patch 008 认知的更严重）**：普通请求（非 abort）即可触发
+`PP3 kv_offload transfer refused: group count mismatch 7 != 8` + `store job dropped`；
+metrics 显示 `kv_offload_store_bytes=0` —— **CPU 卸载层整体瘫痪**（chunk 需要全部
+4 个 PP rank 写入才算完成，PP3 拒绝 = 所有 chunk 不完整 = 永远无法 load）。
+GPU 池满 → 抢占 → store 被丢弃 → 请求 Deferred 等待永远不来的 load → **活锁**
+（引擎不崩但停止服务）。
+
+**诊断方法（v28diag 镜像双侧组视图日志）**：`build_offloading_config` 返回前 +
+`SingleDirectionOffloadingHandler.__init__` 各打一行组清单。实测：
+
+- 调度器侧（各 rank 一致）：8 组 = MLA + KpoolTail + 5×Mamba + **DFlash draft**
+  （draft 组全局存在，layer 45 只在 PP3 有本地层，PP0-2 上是 layers=0 的空组）
+- worker 侧 PP0-2：7 组（非 packed 路径滤掉 KpoolTail 后与调度器对齐）
+- **worker 侧 PP3：8 组** —— PP3 挂 drafter 触发 fork 原生的 **packed 布局分支**
+  （`[CanonicalKVCacheRef(0, block_stride) for _ in kv_cache_groups]`），
+  该分支**漏掉了非 packed 路径的 `participates_in_prefix_caching` 过滤**
+
+**根因**：v15 给 KpoolTail（prefix-match-unit 4 下退化的 ring-buffer 组）加过滤时，
+调度器侧（scheduler.py kv_group_configs）与非 packed worker 路径都加了，
+唯独漏了 packed 分支。计数与位置双重错位（PP3 的 index 1 是 KpoolTail 而非 Mamba）。
+
+**修复（patch 010）**：
+1. packed 分支补同一行过滤 → PP3 = 7 组，四 rank 与调度器完全对齐；
+   KpoolTail 字节仍随 packed 整块传输（与 PP0-2 "不引用即不追踪" 语义一致）
+2. 顺手修 v27 clamp 的循环变量污染：`update_state_after_alloc` 内不再回写
+   loop-carried 的 `num_cached_tokens` / `num_locally_computed_tokens`
+   （原写法会让后续组的期望被一个组的 clamp 结果腐蚀）
+
+**验证（v28 @8093）**：
+- 启动：4×rank `offloading worker groups (7)` 对齐；54k 请求零拒绝，
+  `store_bytes=588MB`；`store_threshold=2` 语义下第三次同前缀请求 **26.2s → 4.3s**
+  （CPU 层 load 命中，~12×）
+- abort 压测 3 轮 × 3 并发流 15s 杀：全活，零警告（v24 同场景必崩）
+- 池满压力（8×148k 填满 1.2M 池 + 长解码）：`num_preemptions_total=1` 触发抢占，
+  引擎持续前进（run 8→7→…→0 全部完成，无 Deferred 卡死）——**v26 硬崩 / v27 活锁
+  的原始场景现在存活**
+- 基准持平 v27：counting 157.9 / json 161.8 / prose 40.7 / code 93.9（v24 区间内）
+
+**已知无害怪癖**：重负载期间周期性 stats 日志行会暂停（Prometheus gauge 全程新鲜，
+负载过后恢复）——非本补丁引入，纯观测层面。
+

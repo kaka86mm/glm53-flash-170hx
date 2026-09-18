@@ -1,0 +1,64 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -139,12 +139,21 @@
+                 (block_stride, 1),
+                 storage_offset=0,
+             )
++            # patch-010: match the non-packed path below and skip groups
++            # excluded from prefix caching (ring-buffer specs such as
++            # KpoolTailSpec), so the per-rank group list stays positionally
++            # aligned with the scheduler-side kv_group_configs.  Without this
++            # filter a packed last PP rank (GLM DFlash drafter packed into
++            # manager blocks) keeps 8 groups vs the scheduler's 7 and every
++            # transfer is refused: stores/loads die silently and pool
++            # pressure turns into a preempt live-lock.
+             self._init_worker(
+                 CanonicalKVCaches(
+                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+                     [
+                         [CanonicalKVCacheRef(0, block_stride)]
+-                        for _ in kv_cache_config.kv_cache_groups
++                        for kv_cache_group in kv_cache_config.kv_cache_groups
++                        if kv_cache_group.kv_cache_spec.participates_in_prefix_caching
+                     ],
+                 )
+             )
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1074,7 +1074,12 @@
+                     num_cached_tokens, tokens_per_block,
+                 )
+                 num_gpu_blocks = len(group_blocks)
+-                num_cached_tokens = num_gpu_blocks * tokens_per_block
++                # patch-010: clamp only this group's arithmetic;
++                # num_cached_tokens describes the whole request and must
++                # survive intact for the remaining groups in this loop.
++                group_cached_tokens = num_gpu_blocks * tokens_per_block
++            else:
++                group_cached_tokens = num_cached_tokens
+             num_locally_computed_gpu_blocks = num_gpu_blocks
+             # Skip null placeholder blocks (used for sliding window or mamba padding).
+             for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+@@ -1094,9 +1099,10 @@
+                     tokens_per_block,
+                     group_config.group_idx,
+                 )
+-                num_locally_computed_tokens = (
+-                    num_locally_computed_gpu_blocks * tokens_per_block
+-                )
++                # patch-010: advisory clamp only -- nothing below reads
++                # the clamped value, and rewriting the loop-carried variable
++                # corrupted the boundary check for the remaining groups.
++                pass
+             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+ 
+             if group_config.sliding_window_size_in_chunks is not None:
+@@ -1107,7 +1113,7 @@
+                     + 1
+                 )
+ 
+-            num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
++            num_chunks = cdiv(group_cached_tokens, tokens_per_chunk)
+             if num_pending_gpu_blocks:
+                 start_chunk_idx = (
+                     num_locally_computed_gpu_blocks // self.config.blocks_per_chunk

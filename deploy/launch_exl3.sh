@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PRODUCTION (09-14 v24 A-pack winner): +48-80% C1, +20-37% N8, warm start 9.3min; rollback = launch_exl3_v22_rollback.sh
+# PRODUCTION (09-14 v26 A-pack winner): +48-80% C1, +20-37% N8, warm start 9.3min; rollback = launch_exl3_v22_rollback.sh
 #   A1  FULL_AND_PIECEWISE CUDA graphs (NO NCCL pinning: tested 09-14, graphs stable
 #        unpinned on PP4; pinning PROTO=Simple cost -7~15% cold prefill (large PP sends)
 #        zebgop same-hardware PP4: decode 45->66-70 C1, 110->158 C4)
@@ -9,10 +9,10 @@
 #   +   persistent triton/vLLM compile caches (startup acceleration)
 # Rollback: bash ~/tools/launch_exl3.sh  (v22 semantics, unchanged)
 set -euo pipefail
-IMAGE=exl3-glm53:v24
-MODEL=/data/models/glm53-exl3-tr3-4bpw
-DFLASH=/data/models/glm53-flash-dflash2
-MARLIN=/data/models/glm53-exl3-marlin
+IMAGE=exl3-glm53:v28
+MODEL=/home/matri/models/glm53-exl3-tr3-4bpw
+DFLASH=/home/matri/models/glm53-flash-dflash2-nv
+MARLIN=/home/matri/models/glm53-exl3-marlin
 TEMPLATE=/home/matri/exl3/chat_templates/glm53-enable-thinking-switch.jinja
 PORT=8093
 OFFLOAD_BYTES=137438953472
@@ -44,15 +44,15 @@ for _i in $(seq 1 36); do
 done
 
 # --- startup acceleration: persistent kernel/compile caches across containers ---
-mkdir -p /data/vllm_caches/triton /data/vllm_caches/vllm
+mkdir -p ~/vllm_caches/triton ~/vllm_caches/vllm
 
 # --- A1: NCCL pinned for full-graph replay on Ampere ---
 docker run -d --name glm-exl3 --runtime=nvidia --gpus all --ipc=host \
   -p $PORT:$PORT \
   -v $MODEL:/model:ro -v $DFLASH:/dflash2:ro -v $MARLIN:/marlin \
-  -v /path/to/repo/chat_templates:/chat_templates:ro \
-  -v /data/vllm_caches/triton:/root/.triton \
-  -v /data/vllm_caches/vllm:/root/.cache/vllm \
+  -v ~/exl3/chat_templates:/chat_templates:ro \
+  -v ~/vllm_caches/triton:/root/.triton \
+  -v ~/vllm_caches/vllm:/root/.cache/vllm \
   -e VLLM_EXL3_MARLIN_DIR=/marlin \
   -e VLLM_EXL3_MARLIN_LAYERS=3-44 \
   -e VLLM_EXL3_NON_ROUTED_FP8=1 \
