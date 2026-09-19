@@ -1,0 +1,62 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index f74de08..feb00d0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1106,12 +1106,33 @@ class OffloadingConnectorScheduler:
+             num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+ 
+             if group_config.sliding_window_size_in_chunks is not None:
+-                assert (
+-                    num_pending_gpu_blocks
+-                    <= group_config.sliding_window_size_in_chunks
++                max_pending_blocks = (
++                    group_config.sliding_window_size_in_chunks
+                     * self.config.blocks_per_chunk
+                     + 1
+                 )
++                if num_pending_gpu_blocks > max_pending_blocks:
++                    # patch-011: the GPU block-hash scan can report a longer
++                    # hashless prefix than the CPU-tier lookup actually loads
++                    # (lookup trims SWA/mamba keys to the trailing window).
++                    # Align the load region to the trailing window instead of
++                    # dying; keys and dst blocks both address the request tail.
++                    logger.warning(
++                        "kv_offload: group %d pending %d blocks exceeds window "
++                        "bound %d (locally_computed_blocks=%d, "
++                        "num_gpu_blocks=%d, num_cached_tokens=%d); "
++                        "clamping to trailing window",
++                        group_config.group_idx,
++                        num_pending_gpu_blocks,
++                        max_pending_blocks,
++                        num_locally_computed_gpu_blocks,
++                        num_gpu_blocks,
++                        num_cached_tokens,
++                    )
++                    num_locally_computed_gpu_blocks = (
++                        num_gpu_blocks - max_pending_blocks
++                    )
++                    num_pending_gpu_blocks = max_pending_blocks
+ 
+             num_chunks = cdiv(group_cached_tokens, tokens_per_chunk)
+             if num_pending_gpu_blocks:
+@@ -1119,7 +1140,19 @@ class OffloadingConnectorScheduler:
+                     num_locally_computed_gpu_blocks // self.config.blocks_per_chunk
+                 )
+                 end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
+-                assert len(offload_keys) >= end_chunk_idx
++                if len(offload_keys) < end_chunk_idx:
++                    # patch-011: lookup-trimmed SWA/mamba key lists hold only
++                    # the trailing window; never schedule a load past them.
++                    logger.warning(
++                        "kv_offload: group %d has %d offload_keys < end chunk "
++                        "%d; clamping load extent",
++                        group_config.group_idx,
++                        len(offload_keys),
++                        end_chunk_idx,
++                    )
++                    end_chunk_idx = len(offload_keys)
++                    if start_chunk_idx > end_chunk_idx:
++                        start_chunk_idx = end_chunk_idx
+                 keys_to_load.extend(offload_keys[start_chunk_idx:end_chunk_idx])
+                 if partial_tail_boundary is not None:
+                     keys_to_load.append(
