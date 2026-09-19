@@ -200,3 +200,26 @@ GPU 池满 → 抢占 → store 被丢弃 → 请求 Deferred 等待永远不来
 **已知无害怪癖**：重负载期间周期性 stats 日志行会暂停（Prometheus gauge 全程新鲜，
 负载过后恢复）——非本补丁引入，纯观测层面。
 
+## ⚠️ 事故警示（2026-09-19 02:00 UTC 更新）：patch 010 不足以进生产，已回滚 v27
+
+**上一节的"验证全绿"结论被真实流量推翻**。压测遗漏了真实 agent 模式
+（多轮会话 + 逐出 + 55k 前缀跨 turn 复用），上线后 ~7h 出现两类新故障：
+
+1. **v28 崩溃**：draft 滑窗组在 CPU 层 load 路径触发裸 assert
+   `num_pending_gpu_blocks <= sliding_window_size_in_chunks * blocks_per_chunk + 1`
+   （`update_state_after_alloc`，比 v27 clamp 更深一层的第三个失配点）——
+   "pending 8 blocks exceeds window bound 5"。短时同前缀复测探针覆盖不到该路径。
+2. **v29（v28+patch-011 把该 assert 改成"clamp 到尾部窗口"）乱码**：输出出现
+   drafter 草稿泄漏（`Draft 4::::`）与错位计数——尾部窗口 clamp 的字节语义错误，
+   mamba 状态组（1 块 vs 期望 12 块）与 draft SWA 组经 CPU 层往返后落到错误块。
+
+**结论**：组计数对齐（patch 010）只是必要条件；mamba 状态 chunk 语义与
+draft SWA 滑窗 chunk 语义在 OffloadingConnector 里根本没有正确实现
+（上游 group-exclusion #52773 家族的深层缺口）。**在这些组被排除或正确实现之前，
+带 CPU KV 卸载的完整链路不可用于生产**。生产已回滚 v27（offload 静默失效但零污染，
+live-lock 风险仅池满高压场景）。
+
+**正确的下一步（patch 012 方向）**：kv_group_configs 与 worker 侧双双只保留
+MLA 组参与卸载（可证明往返干净的组），mamba/draft 组维持 GPU 常驻——
+容量收益缩水（MLA ≈ 11.3KB/token）但语义正确；或等待上游 group-exclusion。
+
