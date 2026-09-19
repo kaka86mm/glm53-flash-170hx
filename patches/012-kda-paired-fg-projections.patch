@@ -1,0 +1,99 @@
+diff --git a/vllm/models/glm5next/nvidia/kda.py b/vllm/models/glm5next/nvidia/kda.py
+index 8bea48f..2f94168 100644
+--- a/vllm/models/glm5next/nvidia/kda.py
++++ b/vllm/models/glm5next/nvidia/kda.py
+@@ -246,6 +246,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+             prefix=f"{prefix}.g_b_proj",
+         )
+         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
++        # patch-012 (#57617 port): stacked f_b/g_b weight, built post-load.
++        self._paired_fg_weight: torch.Tensor | None = None
+         self.o_proj = RowParallelLinear(
+             projection_size,
+             self.hidden_size,
+@@ -275,6 +277,44 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         # every _forward call (it reads an env-derived flag each time).
+         self._conv_state_dim_first = is_conv_state_dim_first()
+ 
++    def _build_paired_fg_weight(self) -> None:
++        """patch-012 (vLLM #57617 port): pair the two same-shape BF16 gate
++        projections so forward runs them as one batched GEMM. Called after all
++        weights are loaded (never during compile/capture). Non-BF16 or
++        shape-mismatched weights keep the two-Linear path.
++        """
++        self._paired_fg_weight = None
++        f_w = self.f_b_proj.weight
++        g_w = self.g_b_proj.weight
++        if (
++            f_w is not None
++            and g_w is not None
++            and f_w.dtype == torch.bfloat16
++            and f_w.shape == g_w.shape
++        ):
++            self._paired_fg_weight = (
++                torch.stack([f_w, g_w]).transpose(1, 2).contiguous()
++            )
++
++    def _paired_fg_projections(
++        self, projected: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Run the paired f_b/g_b projections on the merged projection output.
++
++        f_a and g_a are adjacent head_dim-wide shards of each ``projected``
++        row (after q|k|v|b), read in place as one strided batch — no copies.
++        """
++        assert self._paired_fg_weight is not None
++        fg = projected.as_strided(
++            (2, projected.size(0), self.head_dim),
++            (self.head_dim, projected.stride(0), 1),
++            projected.storage_offset()
++            + 3 * self.local_projection_size
++            + self.local_num_heads,
++        )
++        g1, g2 = torch.bmm(fg, self._paired_fg_weight).unbind(0)
++        return g1, g2
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -299,10 +339,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
+         # intermediate entirely.
+         beta = beta_raw.unsqueeze(0)
+-        g1 = self.f_b_proj(f_a)[0]
++        if self._paired_fg_weight is not None:
++            # patch-012 (#57617 port): one batched GEMM for both gate
++            # projections; bit-identical to the two separate Linears.
++            g1, g_proj_states = self._paired_fg_projections(projected)
++        else:
++            g1 = self.f_b_proj(f_a)[0]
++            g_proj_states = self.g_b_proj(g_a)[0]
+         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+-
+-        g_proj_states = self.g_b_proj(g_a)[0]
+         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
+         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+ 
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index b727eec..45f6dfd 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -950,6 +950,18 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+                     )
+                     weight_loader(param, loaded_weight, **kwargs)
+             loaded_params.add(name)
++        # patch-012 (#57617 port): pair KDA f_b/g_b gate projections into a
++        # single batched-GEMM weight once all weights are in place.
++        built = 0
++        for module in self.modules():
++            if isinstance(module, Glm5NextLinearAttention):
++                module._build_paired_fg_weight()
++                if module._paired_fg_weight is not None:
++                    built += 1
++        if built:
++            logger.info(
++                "patch-012: KDA paired fg projections enabled on %d layers", built
++            )
+         return loaded_params
+ 
+ 
