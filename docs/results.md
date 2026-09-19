@@ -239,3 +239,18 @@ content 为空——这是 thinking 模型在字数约束任务下的正常行�
 MLA 组参与卸载（可证明往返干净的组），mamba/draft 组维持 GPU 常驻——
 容量收益缩水（MLA ≈ 11.3KB/token）但语义正确；或等待上游 group-exclusion。
 
+
+## 🔴 后续（2026-09-19 08:1x UTC）：乱码复发实锤，"更正"被推翻，最终回滚 v30
+
+v31（=v29+patch-012，CPU 层激活）在高峰负载下（KV 池 87%、12 路排队、external hit 3.2%）
+产出真·KV 污染乱码（多语种词沙拉）。取证日志（12 次 patch-011 clamp 事件与污染窗口吻合）：
+
+**终审结论**：池压逐出 → CPU 回载 → mamba/draft SWA 组 chunk 语义未正确实现 →
+patch-011 防崩但装错字节 → 上下文污染。**b2fa28a 的原始分析正确，
+b26877d 的"更正"过度矫正**（v27 对照只推翻单个计数样本；v29 的 7h 干净是低池载假阴性）。
+
+- 生产 = **v30**（无 CPU 卸载层，零污染风险；patch-012 paired-fg 保留）
+- patch-010/011 路线**全线判死**，patch-011 降级为仓库防崩历史
+- CPU 层 128G 的正确路径 = **MLA-only 组排除**（未来 patch-013）：kv_group_configs 与
+  worker 双侧只留 MLA 组（可证明往返干净），mamba/draft 组 GPU 常驻；容量按
+  MLA≈11.3KB/token 计；开工前置条件 = 满池逐出回放探针（低池载验收不算闭环）
